@@ -998,6 +998,7 @@ Memory::MemStore* Memory::MemStore::mkIf(const expr &cond, MemStore *then,
     return then;
 
   auto st = make_unique<MemStore>(COND);
+  st->size.emplace(cond);
   st->next = then;
   st->els = els;
   auto ret = st.get();
@@ -1070,7 +1071,7 @@ void Memory::MemStore::print(std::ostream &os) const {
       todo.push_back(st->els);
       os << "\nElse: #" << get_id(st->els);
     }
-    os << "\n-----------------------------------------------------------\n\n";
+    os << "\n\n-----------------------------------------------------------\n";
   } while (!todo.empty());
 }
 
@@ -1274,6 +1275,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
     auto &ptr = *get<1>(key);
     auto &alias = *get<2>(key);
 
+    // TODO: don't process children if store matches perfectly or full write
     bool has_all_deps = true;
     if (st.next && !vals.count({st.next, &ptr, &alias})) {
       todo.emplace_back(st.next, &ptr, &alias);
@@ -1320,9 +1322,15 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         added_undef_vars = true;
       }
 
-      if (v1)
-        val.emplace_back(StateValue::mkIf(cond, v, (*v1)[i / bytes_per_load]));
-      else
+      if (v1) {
+        auto &v1_sv = (*v1)[i / bytes_per_load];
+        if (v.non_poison.isFalse()) {
+          val.emplace_back(expr(v1_sv.value),
+                           expr::mkIf(cond, v.non_poison, v1_sv.non_poison));
+        } else {
+          val.emplace_back(StateValue::mkIf(cond, v, v1_sv));
+        }
+      } else
         val.emplace_back(cond.isFalse() ? poison_byte : v);
     };
 
@@ -1341,9 +1349,11 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       return np.isBool() ? np : np == 0;
     };
 
+    // TODO: support sub-byte access
+
     switch (st.type) {
       case MemStore::INT_VAL: {
-        StateValue value;
+        StateValue value = st.value;
         // TODO fill in value
 
         // allow zero -> null type punning
@@ -1407,7 +1417,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             StateValue sv;
             if (type == DATA_INT) {
               sv.value      = byte.nonptrValue();
-              sv.non_poison = !byte.isPtr() && byte.nonptrNonpoison();
+              sv.non_poison = !byte.isPtr() && byte.nonptrNonpoison() == 0;
             } else {
               sv.value      = expr::mkIf(byte.isPtr(),
                                          byte.ptrValue(),
@@ -1416,8 +1426,8 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
                                          byte.ptrNonpoison() &&
                                            byte.ptrByteoffset() == i + j,
                                          // allow zero -> null type punning
-                                         byte.nonptrNonpoison() &&
-                                           sv.value == 0);
+                                         byte.nonptrNonpoison() == 0 &&
+                                           byte.nonptrValue() == 0);
             }
             widesv = j == 0 ? move(sv) : widesv.concat(sv);
           }
@@ -1439,7 +1449,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       }
 
       case MemStore::COND: {
-        assert(st.els);
+        assert(st.size && st.els);
         auto &v2 = vals.at({st.els, &ptr, &alias});
         for (unsigned i = 0; i < num_loads; ++i) {
           val.emplace_back(StateValue::mkIf(*st.size, (*v1)[i], v2[i]));

@@ -17,6 +17,7 @@
 #include <vector>
 
 namespace smt { class Model; }
+
 namespace IR {
 
 class Memory;
@@ -218,6 +219,7 @@ class Memory {
     void setMayAlias(bool local, unsigned bid);
     // [start, limit]
     void setMayAliasUpTo(bool local, unsigned limit, unsigned start = 0);
+    void setFullAlias(bool local);
     void setNoAlias(bool local, unsigned bid);
 
     void intersectWith(const AliasSet &other);
@@ -349,6 +351,7 @@ public:
 
   void mkAxioms(const Memory &other) const;
 
+  static void cleanGlobals();
   static void resetGlobals();
   void syncWithSrc(const Memory &src);
 

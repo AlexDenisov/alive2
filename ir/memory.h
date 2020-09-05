@@ -131,10 +131,10 @@ public:
   smt::expr blockSize() const;
 
   const smt::expr& operator()() const { return p; }
-  // Returns expr with short_bid+offset. It strips attrs away.
+  // Returns expr with bid & offset only. It strips attrs away.
   // If this pointer is constructed with var_name (has_attr with false),
   // the returned expr is the variable.
-  smt::expr shortPtr() const;
+  smt::expr shortPtr(bool short_bid) const;
   smt::expr release() { return std::move(p); }
   unsigned bits() const { return p.bits(); }
 
@@ -308,7 +308,7 @@ class Memory {
 
   StateValue load(const Pointer &ptr, unsigned bytes,
                   std::set<smt::expr> &undef, unsigned align,
-                  bool left2right = true, DataType type = DATA_ANY);
+                  DataType type = DATA_ANY);
   StateValue load(const Pointer &ptr, const Type &type,
                   std::set<smt::expr> &undef, unsigned align);
 

@@ -1333,9 +1333,10 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 
     // TODO: optimize full stores to GC unreachable nodes?
     auto store = [&](unsigned i, const StateValue &v, bool range) {
+      assert(st.ptr);
       expr cond;
       if (range) {
-        assert(st.ptr && st.size);
+        assert(st.size);
         cond = ptr.getBid() == st.ptr->getBid();
         expr load_offset = (ptr + i).getShortOffset();
         cond &= load_offset.uge((*st.ptr + i).getShortOffset());
@@ -1344,8 +1345,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           = (*st.ptr + *st.size + expr::mkInt(-i, bits_for_offset));
         cond &= load_offset.ult(upper_bound.getShortOffset());
       } else {
-        assert(st.ptr && i == 0);
-        cond = ptr == *st.ptr;
+        cond = (ptr + i) == *st.ptr;
       }
 
       if (!added_undef_vars && !cond.isFalse()) {
@@ -1395,7 +1395,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           StateValue value;
-          if (bytes_per_load == st.value.bits()) {
+          if (bytes_per_load*8 == st.value.bits()) {
             value = st.value;
           } else {
             // TODO: optimize loads from small stores to avoid shifts

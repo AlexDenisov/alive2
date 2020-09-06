@@ -576,6 +576,8 @@ expr Pointer::isAligned(unsigned align) {
     // This is stricter than checking getAddress(), but as addresses are not
     // observed, program shouldn't be able to distinguish this from checking
     // getAddress()
+#if 0
+    // TODO: recheck if this optimization is any useful..
     auto zero = expr::mkUInt(0, bits);
     auto newp = p.extract(totalBits() - 1, bits_for_ptrattrs + bits)
                  .concat(zero);
@@ -583,7 +585,8 @@ expr Pointer::isAligned(unsigned align) {
       newp = newp.concat(getAttrs());
     p = move(newp);
     assert(!p.isValid() || p.bits() == totalBits());
-    return { blk_align && offset.extract(bits - 1, 0) == zero };
+#endif
+    return { blk_align && offset.extract(bits - 1, 0) == 0 };
   }
 
   return getAddress().extract(bits - 1, 0) == 0;
@@ -1332,18 +1335,27 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
     }
 
     // TODO: optimize full stores to GC unreachable nodes?
-    auto store = [&](unsigned i, const StateValue &v, bool range) {
+    auto store = [&](unsigned i, const StateValue &v, unsigned total_size) {
       assert(st.ptr);
       expr cond;
-      if (range) {
+      if (bytes*8 != total_size || st.align < bytes || align < bytes) {
         assert(st.size);
         cond = ptr.getBid() == st.ptr->getBid();
         expr load_offset = (ptr + i).getShortOffset();
-        cond &= load_offset.uge((*st.ptr + i).getShortOffset());
+        expr store_offset = st.ptr->getShortOffset();
 
-        auto upper_bound
-          = (*st.ptr + *st.size + expr::mkInt(-i, bits_for_offset));
-        cond &= load_offset.ult(upper_bound.getShortOffset());
+        if (!ptr.getShortOffset().eq(store_offset))
+          cond &= load_offset.uge(store_offset);
+
+        // skip upperbound conditions if loading from the same ptr as store
+        // and there's space left to read
+        uint64_t store_size;
+        if (!(load_offset.eq(store_offset) && st.size->isUInt(store_size) &&
+              store_size >= bytes_per_load)) {
+          auto upper_bound
+            = (*st.ptr + *st.size + expr::mkInt(-i, bits_for_offset));
+          cond &= load_offset.ult(upper_bound.getShortOffset());
+        }
       } else {
         cond = (ptr + i) == *st.ptr;
       }
@@ -1354,74 +1366,85 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         added_undef_vars = true;
       }
 
+      assert(!v.value.isValid() || v.value.bits() == bytes_per_load*8);
+      assert(!v.non_poison.isValid() ||
+             v.non_poison.bits() == bytes_per_load*8);
+
       if (v1) {
         auto &v1_sv = (*v1)[i / bytes_per_load];
-        if (v.non_poison.isFalse()) {
-          val.emplace_back(expr(v1_sv.value), !cond && v1_sv.non_poison);
-        } else {
-          val.emplace_back(StateValue::mkIf(cond, v, v1_sv));
-        }
+        val.emplace_back(StateValue::mkIf(cond, v, v1_sv));
       } else
         val.emplace_back(cond.isFalse() ? poison_byte : v);
     };
 
-    auto store_ptr = [&](const StateValue &ptr, unsigned i = -1) {
+    auto store_ptr = [&](const StateValue &ptr) {
       if (num_loads == 1) {
-        assert(i == -1u || i == 0);
-        store(0, ptr, false);
+        store(0, ptr, bits_program_pointer);
         return;
       }
-      if (i != -1u) {
-        store(i, { ptr.value.concat(expr::mkUInt(i, 3)),
-                   expr(ptr.non_poison) }, true);
-        return;
-      }
+      // FIXME i is wrong for unaligned load/stores
       for (unsigned i = 0; i < bytes; i += bytes_per_load) {
         store(i, { ptr.value.concat(expr::mkUInt(i, 3)),
-                   expr(ptr.non_poison) }, false);
+                   expr(ptr.non_poison) }, bits_program_pointer);
       }
     };
 
-    auto np_bool = [](const expr &np) {
-      return np.isBool() ? np : np == 0;
+    auto combine_np = [](const expr &np, const expr &cond) {
+      return np | expr::mkIf(cond, expr::mkUInt(0, np), expr::mkInt(-1, np));
     };
-
-    // TODO: support sub-byte access
 
     switch (st.type) {
       case MemStore::INT_VAL: {
         assert(st.ptr);
-        bool is_range_store = bytes_per_load*8 != st.value.bits();
+        auto bits = st.value.bits();
 
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           StateValue value;
-          if (bytes_per_load*8 == st.value.bits()) {
+          if (bits == bytes_per_load*8) {
             value = st.value;
-          } else {
+          }
+          else if (bytes*8 == bits && st.align >= bytes && align >= bytes) {
+            unsigned high = little_endian
+                              ? (i+1) * bytes_per_load * 8 - 1
+                              : (num_loads - i) * bytes_per_load * 8 - 1;
+            unsigned low = little_endian
+                             ? i * bytes_per_load * 8
+                             : (num_loads - i - 1) * bytes_per_load * 8;
+            value = st.value.extract(high, low);
+          }
+          else {
             // TODO: optimize loads from small stores to avoid shifts
             auto diff = (ptr + i).getOffset() - st.ptr->getOffset();
             diff = (diff * expr::mkUInt(8 * bytes_per_load, diff))
-                    .zextOrTrunc(st.value.bits());
+                    .zextOrTrunc(bits);
 
             if (little_endian) {
               value.value = st.value.value.lshr(diff)
                               .extract(bytes_per_load * 8 - 1, 0);
+              value.non_poison = st.value.non_poison.lshr(diff)
+                                   .extract(bytes_per_load * 8 - 1, 0);
             } else {
-              auto bits = st.value.bits();
               value.value = (st.value.value << diff)
                               .extract(bits - 1, bits - bytes_per_load * 8);
+              value.non_poison = (st.value.non_poison << diff)
+                                 .extract(bits - 1, bits - bytes_per_load * 8);
             }
-            value.non_poison = true;
+
+            // optimization: if all ones, output is guaranteed to be false
+            // regardless of which byte is read
+            if (value.non_poison.isAllOnes())
+              value.non_poison = expr::mkInt(-1, bytes_per_load * 8);
           }
+
           assert(!st.value.isValid() || !(*st.ptr)().isValid() ||
                  value.bits() == bytes_per_load * 8);
 
           // allow zero -> null type punning
           if (type == DATA_PTR) {
             store_ptr({ Pointer::mkNullPointer(*this).release(),
-                        np_bool(value.non_poison) && value.value == 0 }, i);
+                        combine_np(value.non_poison, value.value == 0) });
           } else {
-            store(i, value, is_range_store);
+            store(i, value, bits);
           }
         }
         break;
@@ -1431,8 +1454,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         // ptr -> int: type punning is poison
         if (type == DATA_INT) {
           for (unsigned i = 0; i < bytes; i += bytes_per_load) {
-            // TODO: optimize is_range
-            store(i, poison_byte, true);
+            store(i, poison_byte, bits_program_pointer);
           }
         } else {
           store_ptr(st.value);
@@ -1443,7 +1465,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         // allow zero -> null type punning
         if (type == DATA_PTR) {
           store_ptr({ Pointer::mkNullPointer(*this).release(),
-                      np_bool(st.value.non_poison) && st.value.value == 0 });
+                      combine_np(st.value.non_poison, st.value.value == 0) });
           break;
         }
 
@@ -1452,8 +1474,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           elem = elem.concat(st.value);
         }
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
-          // TODO: optimize is_range
-          store(i, elem, true);
+          store(i, elem, 0);
         }
         break;
       }
@@ -1461,8 +1482,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       case MemStore::COPY: {
         auto &v2 = vals.at({st.next, &*st.ptr_src, &st.src_alias});
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
-          // TODO: optimize is_range
-          store(i, v2[i/bytes_per_load], true);
+          store(i, v2[i/bytes_per_load], 0);
         }
         break;
       }
@@ -1478,8 +1498,9 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             StateValue sv;
             if (type == DATA_INT) {
               sv.value      = byte.nonptrValue();
-              sv.non_poison = !byte.isPtr() && byte.nonptrNonpoison() == 0;
+              sv.non_poison = combine_np(byte.nonptrNonpoison(), !byte.isPtr());
             } else {
+              assert(type == DATA_PTR);
               sv.value      = expr::mkIf(byte.isPtr(),
                                          byte.ptrValue(),
                                          Pointer::mkNullPointer(*this)());
@@ -1489,6 +1510,10 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
                                          // allow zero -> null type punning
                                          byte.nonptrNonpoison() == 0 &&
                                            byte.nonptrValue() == 0);
+
+              auto npbits = bytes_per_load * bits_poison_per_byte;
+              sv.non_poison = expr::mkIf(sv.non_poison, expr::mkUInt(0, npbits),
+                                         expr::mkInt(-1, npbits));
             }
             widesv = j == 0 ? move(sv) : widesv.concat(sv);
           }
@@ -1530,6 +1555,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
     for (unsigned i = 1; i < num_loads; ++i) {
       ret = ret.concat(val[little_endian ? num_loads-1 - i : i]);
     }
+    assert(!ret.isValid() || ret.bits() == bytes * 8);
     return ret;
   }
 
@@ -2098,7 +2124,7 @@ unsigned Memory::getStoreByteSize(const Type &ty) {
   return divide_up(ty.bits(), 8);
 }
 
-void Memory::store(const Pointer &ptr, unsigned offset, const StateValue &v,
+void Memory::store(const Pointer &ptr, unsigned offset, StateValue &&v,
                    const Type &type, unsigned align,
                    const set<expr> &undef_vars) {
   auto aty = type.getAsAggregateType();
@@ -2116,13 +2142,14 @@ void Memory::store(const Pointer &ptr, unsigned offset, const StateValue &v,
 
   } else if (type.isPtrType()) {
     store(ptr + offset, bits_program_pointer / 8, align,
-          make_unique<MemStore>(MemStore::PTR_VAL, v, undef_vars));
+          make_unique<MemStore>(MemStore::PTR_VAL, move(v), undef_vars));
 
   } else {
     unsigned bits = round_up(v.bits(), 8);
     auto val = v.zextOrTrunc(bits);
     store(ptr + offset, bits / 8, align,
-          make_unique<MemStore>(MemStore::INT_VAL, val, undef_vars));
+          make_unique<MemStore>(MemStore::INT_VAL,
+                                type.toInt(*state, move(val)), undef_vars));
   }
 }
 
@@ -2135,7 +2162,7 @@ void Memory::store(const expr &p, const StateValue &v, const Type &type,
   if (!state->isInitializationPhase())
     state->addUB(ptr.isDereferenceable(getStoreByteSize(type), align, true));
 
-  store(ptr, 0, v, type, align, undef_vars);
+  store(ptr, 0, StateValue(v), type, align, undef_vars);
 }
 
 StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,
@@ -2163,7 +2190,9 @@ StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,
   }
 
   bool is_ptr = type.isPtrType();
-  auto val = load(ptr, bytecount, undef, align, is_ptr ? DATA_PTR : DATA_INT);
+  auto val = type.fromInt(load(ptr, bytecount, undef, align,
+                               is_ptr ? DATA_PTR : DATA_INT)
+                          .trunc(type.bits(), type.np_bits()));
 
   // partial order reduction for fresh pointers
   // can alias [0, next_ptr++] U extra_tgt_consts
@@ -2220,7 +2249,7 @@ void Memory::memset(const expr &p, const StateValue &val, const expr &bytesize,
     state->addUB(ptr.isDereferenceable(bytesize, align, true));
 
   store(ptr, &bytesize, align,
-        make_unique<MemStore>(MemStore::CONST, val, undef_vars));
+        make_unique<MemStore>(MemStore::CONST, StateValue(val), undef_vars));
 }
 
 void Memory::memcpy(const expr &d, const expr &s, const expr &bytesize,

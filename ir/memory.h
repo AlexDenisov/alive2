@@ -253,9 +253,9 @@ class Memory {
     MemStore *next = nullptr, *els = nullptr;
 
     // regular int/ptr store
-    MemStore(Type type, const StateValue &value = {},
+    MemStore(Type type, StateValue &&value = {},
              const std::set<smt::expr> &undef = {})
-      : type(type), value(value), undef(undef) {}
+      : type(type), value(std::move(value)), undef(undef) {}
 
     // copy from src
     MemStore(const Pointer &src, const smt::expr *size, unsigned align_src);
@@ -316,7 +316,7 @@ class Memory {
              std::unique_ptr<MemStore> &&data);
   void store(std::optional<Pointer> ptr, unsigned bytes, unsigned align,
              std::unique_ptr<MemStore> &&data);
-  void store(const Pointer &ptr, unsigned offset, const StateValue &v,
+  void store(const Pointer &ptr, unsigned offset, StateValue &&v,
              const Type &type, unsigned align,
              const std::set<smt::expr> &undef_vars);
 

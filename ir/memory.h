@@ -416,10 +416,9 @@ public:
   smt::expr int2ptr(const smt::expr &val) const;
 
   std::tuple<smt::expr, Pointer, std::set<smt::expr>>
-    refined(const Memory &other,
-            bool skip_constants,
-            const std::vector<PtrInput> *set_ptrs = nullptr)
-      const;
+    refined(const Memory &other, bool fncall,
+            const std::vector<PtrInput> *set_ptrs = nullptr,
+            const std::vector<PtrInput> *set_ptrs_other = nullptr) const;
 
   // Returns true if a nocapture pointer byte is not in the memory.
   smt::expr checkNocapture() const;

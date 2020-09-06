@@ -2388,19 +2388,76 @@ expr Memory::blockRefined(const Pointer &src, const Pointer &tgt, unsigned bid,
 }
 
 tuple<expr, Pointer, set<expr>>
-Memory::refined(const Memory &other, bool skip_constants,
-                const vector<PtrInput> *set_ptrs) const {
+Memory::refined(const Memory &other, bool fncall,
+                const vector<PtrInput> *set_ptrs,
+                const vector<PtrInput> *set_ptrs_other) const {
   if (num_nonlocals <= has_null_block)
     return { true, Pointer(*this, expr()), {} };
 
   assert(!memory_unused());
+  assert(!set_ptrs || fncall);
+  assert(((set_ptrs != 0) ^ (set_ptrs_other != 0)) == 0);
+
   Pointer ptr(*this, "#idx_refinement", false);
   expr ptr_bid = ptr.getBid();
   expr offset = ptr.getOffset();
   expr ret(true);
   set<expr> undef_vars;
 
-  // TODO: check that set of tgt written locs in set of src written locs
+  auto relevant = [&](const Memory &m, const MemStore *st) {
+    if (!st->ptr)
+      return false;
+
+    if (set_ptrs) {
+      auto bid = st->ptr->getBid();
+      for (auto &p : *((&m == this) ? set_ptrs : set_ptrs_other)) {
+        if (!(Pointer(m, p.val.value).getBid() == bid).isFalse())
+          return true;
+      }
+      return false;
+    } else {
+      return st->alias.numMayAlias(false) > 0;
+    }
+  };
+
+  // 1) Check that set of tgt written locs is in set of src written locs
+  if (other.store_seq_head) {
+    auto collect_stores = [&](const Memory &m) {
+      map<Pointer, pair<expr, expr>> stores; // ptr -> (path, size)
+      vector<pair<const MemStore*, expr>> todo = { {m.store_seq_head, true} };
+      do {
+        auto [st, path] = todo.back();
+        todo.pop_back();
+
+        if (st->type == MemStore::COND) {
+          todo.emplace_back(st->next, path && *st->size);
+          todo.emplace_back(st->els,  path && !*st->size);
+          continue;
+        }
+
+        if (relevant(m, st)) {
+          assert(st->size);
+          auto [I, inserted] = stores.try_emplace(*st->ptr, path, *st->size);
+          if (!inserted) {
+            I->second.first |= path;
+            I->second.second = I->second.second.umax(*st->size);
+          }
+        }
+
+        if (st->next) {
+          todo.emplace_back(st->next, move(path));
+        }
+      } while (!todo.empty());
+
+      return stores;
+    };
+
+    // ptr -> (path, size)
+    auto src_stores = collect_stores(*this);
+    auto tgt_stores = collect_stores(other);
+
+    // TODO: now check that tgt_stores is in src_stores
+  }
 
   // TODO: check that written locs in src are refined by tgt
 

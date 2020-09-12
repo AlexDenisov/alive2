@@ -2416,14 +2416,17 @@ Memory::refined(const Memory &other, bool fncall,
       }
       return false;
     } else {
+      // TODO: check local escaped blocks
       return st->alias.numMayAlias(false) > 0;
     }
   };
 
   // 1) Check that set of tgt written locs is in set of src written locs
+  // i.e., we can remove stores but can't introduce stores to new locations
   if (other.store_seq_head) {
     auto collect_stores = [&](const Memory &m) {
-      map<Pointer, pair<expr, expr>> stores; // ptr -> (path, size)
+      // bid -> (path, offset, size)*
+      map<expr, vector<tuple<expr, expr, expr>>> stores;
       vector<pair<const MemStore*, expr>> todo = { {m.store_seq_head, true} };
       do {
         auto [st, path] = todo.back();
@@ -2435,13 +2438,10 @@ Memory::refined(const Memory &other, bool fncall,
           continue;
         }
 
-        if (relevant(m, st)) {
+        if (st->type != MemStore::FN && relevant(m, st)) {
           assert(st->size);
-          auto [I, inserted] = stores.try_emplace(*st->ptr, path, *st->size);
-          if (!inserted) {
-            I->second.first |= path;
-            I->second.second = I->second.second.umax(*st->size);
-          }
+          stores[st->ptr->getBid()]
+            .emplace_back(path, st->ptr->getShortOffset(), *st->size);
         }
 
         if (st->next) {
@@ -2452,11 +2452,33 @@ Memory::refined(const Memory &other, bool fncall,
       return stores;
     };
 
-    // ptr -> (path, size)
+    // bid -> (path, offset, size)*
     auto src_stores = collect_stores(*this);
     auto tgt_stores = collect_stores(other);
+    vector<tuple<expr, expr, expr>> empty_vector;
 
-    // TODO: now check that tgt_stores is in src_stores
+    for (auto &[bid, tgt_list] : tgt_stores) {
+      auto src_I = src_stores.find(bid);
+      auto &src_list = src_I == src_stores.end() ? empty_vector : src_I->second;
+
+      for (auto &[tgt_path, tgt_offset, tgt_size] : tgt_list) {
+        OrExpr src_domain;
+        // fast path: stores match and tgt domain -> src domain
+        for (auto &[src_path, src_offset, src_size] : src_list) {
+          if (tgt_offset.eq(src_offset) && tgt_size.ule(src_size).isTrue())
+            src_domain.add(src_path);
+        }
+
+        if (src_domain.contains(tgt_path))
+          continue;
+
+        // slow path
+        // TODO
+        cout << "[MEMREF] SLOW PATH: " << bid << " / tgt_path=" << tgt_path
+             << "\nsrc_domain=" << src_domain << "\noffset=" << tgt_offset
+             << " size=" << tgt_size << endl;
+      }
+    }
   }
 
   // TODO: check that written locs in src are refined by tgt

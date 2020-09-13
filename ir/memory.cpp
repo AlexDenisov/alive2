@@ -24,29 +24,13 @@ using namespace util;
   // Non-local block ids (assuming that no block is optimized out):
   // 1. null block: 0
   // 2. global vars in source: 1 ~ num_globals_src
-  // 3. pointer argument inputs:
-  //      num_globals_src + 1 ~ num_globals_src + num_ptrinputs
-  // 4. a block reserved for encoding the memory touched by calls:
-  //      num_globals_src + num_ptrinputs + 1
-  // 5. nonlocal blocks returned by loads/calls:
-  //      num_globals_src + num_ptrinputs + 2 ~ num_nonlocals_src - 1:
-  // 6. global vars in target only:
+  // 3. ptr args, fn call returned ptrs, ptr loads
+  // 4. global vars in target only:
   //      num_nonlocals_src ~ num_nonlocals - 1
 
-static unsigned ptr_next_idx;
 static unsigned next_local_bid;
 static unsigned next_global_bid;
-static unsigned next_ptr_input;
 static unsigned next_fn_memblock;
-
-static bool observesAddresses() {
-  return IR::has_ptr2int || IR::has_int2ptr;
-}
-
-static unsigned zero_bits_offset() {
-  assert(is_power2(bits_byte));
-  return ilog2(bits_byte / 8);
-}
 
 static bool byte_has_ptr_bit() {
   return does_int_mem_access && does_ptr_mem_access;
@@ -79,15 +63,10 @@ static string local_name(const State *s, const char *name) {
   return string(name) + (s->isSource() ? "_src" : "_tgt");
 }
 
-static bool is_initial_memblock(const expr &e) {
-  string name;
-  expr blk;
-  unsigned hi, lo;
-  if (e.isExtract(blk, hi, lo))
-    name = blk.fn_name();
-  else
-    name = e.fn_name();
-  return name == "init_mem";
+// Assumes that both begin + len don't overflow
+static expr disjoint(const expr &begin1, const expr &len1, const expr &begin2,
+                     const expr &len2) {
+  return begin1.uge(begin2 + len2) || begin2.uge(begin1 + len1);
 }
 
 static expr load_bv(const expr &var, const expr &idx0) {
@@ -286,559 +265,17 @@ ostream& operator<<(ostream &os, const Byte &byte) {
   }
   return os;
 }
-}
 
-static bool ptr_has_local_bit() {
-  return (num_locals_src || num_locals_tgt) && num_nonlocals;
-}
-
-static unsigned bits_shortbid() {
-  return bits_for_bid - ptr_has_local_bit();
-}
-
-static expr attr_to_bitvec(const ParamAttrs &attrs) {
-  if (!bits_for_ptrattrs)
-    return expr();
-
-  uint64_t bits = 0;
-  auto idx = 0;
-  auto to_bit = [&](bool b, const ParamAttrs::Attribute &a) -> uint64_t {
-    return b ? ((attrs.has(a) ? 1 : 0) << idx++) : 0;
-  };
-  bits |= to_bit(has_nocapture, ParamAttrs::NoCapture);
-  bits |= to_bit(has_readonly, ParamAttrs::ReadOnly);
-  bits |= to_bit(has_readnone, ParamAttrs::ReadNone);
-  return expr::mkUInt(bits, bits_for_ptrattrs);
-}
-
-namespace IR {
-
-Pointer::Pointer(const Memory &m, const char *var_name, const expr &local,
-                 bool unique_name, bool align, const expr &attr) : m(m) {
-  string name = var_name;
-  if (unique_name)
-    name += '!' + to_string(ptr_next_idx++);
-
-  unsigned bits = totalBitsShort() + !align * zero_bits_offset();
-  p = prepend_if(local.toBVBool(),
-                 expr::mkVar(name.c_str(), bits), ptr_has_local_bit());
-  if (align)
-    p = p.concat_zeros(zero_bits_offset());
-  if (bits_for_ptrattrs)
-    p = p.concat(attr.isValid() ? attr : expr::mkUInt(0, bits_for_ptrattrs));
-  assert(!local.isValid() || p.bits() == totalBits());
-}
-
-Pointer::Pointer(const Memory &m, expr repr) : m(m), p(move(repr)) {
-  assert(!p.isValid() || p.bits() == totalBits());
-}
-
-Pointer::Pointer(const Memory &m, unsigned bid, bool local)
-  : m(m), p(
-    prepend_if(expr::mkUInt(local, 1),
-               expr::mkUInt(bid, bits_shortbid())
-                 .concat_zeros(bits_for_offset + bits_for_ptrattrs),
-               ptr_has_local_bit())) {
-  assert((local && bid < m.numLocals()) || (!local && bid < num_nonlocals));
-  assert(p.bits() == totalBits());
-}
-
-Pointer::Pointer(const Memory &m, unsigned bid, bool local, const expr &offset)
-  : m(m), p(
-    prepend_if(expr::mkUInt(local, 1),
-               expr::mkUInt(bid, bits_shortbid())
-                 .concat(offset).concat_zeros(bits_for_ptrattrs),
-               ptr_has_local_bit())) {
-  assert((local && bid < m.numLocals()) || (!local && bid < num_nonlocals));
-  assert(!offset.isValid() || p.bits() == totalBits());
-}
-
-Pointer::Pointer(const Memory &m, const expr &bid, const expr &offset,
-                 const expr &attr) : m(m), p(bid.concat(offset)) {
-  if (bits_for_ptrattrs)
-    p = p.concat(attr.isValid() ? attr : expr::mkUInt(0, bits_for_ptrattrs));
-  assert(!bid.isValid() || !offset.isValid() || p.bits() == totalBits());
-}
-
-unsigned Pointer::totalBits() {
-  return bits_for_ptrattrs + bits_for_bid + bits_for_offset;
-}
-
-unsigned Pointer::totalBitsShort() {
-  return bits_shortbid() + bitsShortOffset();
-}
-
-unsigned Pointer::bitsShortOffset() {
-  return bits_for_offset - zero_bits_offset();
-}
-
-expr Pointer::isLocal(bool simplify) const {
-  if (m.numLocals() == 0)
-    return false;
-  if (m.numNonlocals() == 0)
-    return true;
-
-  auto bit = totalBits() - 1;
-  expr local = p.extract(bit, bit);
-
-  if (simplify && is_initial_memblock(local))
-    return false;
-
-  return local == 1;
-}
-
-expr Pointer::getBid() const {
-  return p.extract(totalBits() - 1, bits_for_offset + bits_for_ptrattrs);
-}
-
-expr Pointer::getShortBid() const {
-  return p.extract(totalBits() - 1 - ptr_has_local_bit(),
-                   bits_for_offset + bits_for_ptrattrs);
-}
-
-expr Pointer::getOffset() const {
-  return p.extract(bits_for_offset + bits_for_ptrattrs - 1, bits_for_ptrattrs);
-}
-
-expr Pointer::getOffsetSizet() const {
-  return getOffset().sextOrTrunc(bits_size_t);
-}
-
-expr Pointer::getShortOffset() const {
-  return p.extract(bits_for_offset + bits_for_ptrattrs - 1,
-                   bits_for_ptrattrs + zero_bits_offset());
-}
-
-expr Pointer::getAttrs() const {
-  return bits_for_ptrattrs ? p.extract(bits_for_ptrattrs - 1, 0) : expr();
-}
-
-expr Pointer::getValue(const char *name, const FunctionExpr &local_fn,
-                       const FunctionExpr &nonlocal_fn,
-                       const expr &ret_type, bool src_name) const {
-  if (!p.isValid())
-    return {};
-
-  auto bid = getShortBid();
-  expr non_local;
-
-  if (auto val = nonlocal_fn.lookup(bid))
-    non_local = *val;
-  else {
-    string uf = src_name ? local_name(m.state, name) : name;
-    non_local = expr::mkUF(uf.c_str(), { bid }, ret_type);
-  }
-
-  if (auto local = local_fn(bid))
-    return expr::mkIf(isLocal(), *local, non_local);
-  return non_local;
-}
-
-expr Pointer::getAddress(bool simplify) const {
-  assert(observesAddresses());
-
-  auto bid = getShortBid();
-  auto zero = expr::mkUInt(0, bits_size_t - 1);
-  // fast path for null ptrs
-  auto non_local
-    = simplify && bid.isZero() && has_null_block ?
-          zero : expr::mkUF("blk_addr", { bid }, zero);
-  // Non-local block area is the lower half
-  non_local = expr::mkUInt(0, 1).concat(non_local);
-
-  expr addr;
-  if (auto local = m.local_blk_addr(bid))
-    // Local block area is the upper half of the memory
-    addr = expr::mkIf(isLocal(), expr::mkUInt(1, 1).concat(*local), non_local);
+bool Memory::isInitialMemBlock(const expr &e) {
+  string name;
+  expr blk;
+  unsigned hi, lo;
+  if (e.isExtract(blk, hi, lo))
+    name = blk.fn_name();
   else
-    addr = move(non_local);
-
-  return addr + getOffsetSizet();
+    name = e.fn_name();
+  return name == "init_mem";
 }
-
-expr Pointer::blockSize() const {
-  // ASSUMPTION: programs can only allocate up to half of address space
-  // so the first bit of size is always zero.
-  // We need this assumption to support negative offsets.
-  return expr::mkUInt(0, 1)
-           .concat(getValue("blk_size", m.local_blk_size, m.non_local_blk_size,
-                             expr::mkUInt(0, bits_size_t - 1)));
-}
-
-expr Pointer::shortPtr(bool short_bid) const {
-  auto off = zero_bits_offset();
-  return p.extract(totalBits() - 1 - (short_bid ? ptr_has_local_bit() : 0),
-                   bits_for_ptrattrs + off);
-}
-
-Pointer Pointer::operator+(const expr &bytes) const {
-  return { m, getBid(), getOffset() + bytes.zextOrTrunc(bits_for_offset),
-           getAttrs() };
-}
-
-Pointer Pointer::operator+(unsigned bytes) const {
-  return *this + expr::mkUInt(bytes, bits_for_offset);
-}
-
-void Pointer::operator+=(const expr &bytes) {
-  p = (*this + bytes).p;
-}
-
-expr Pointer::addNoOverflow(const expr &offset) const {
-  return getOffset().add_no_soverflow(offset);
-}
-
-expr Pointer::operator==(const Pointer &rhs) const {
-  return p.extract(totalBits() - 1, bits_for_ptrattrs) ==
-         rhs.p.extract(totalBits() - 1, bits_for_ptrattrs);
-}
-
-expr Pointer::operator!=(const Pointer &rhs) const {
-  return !operator==(rhs);
-}
-
-#define DEFINE_CMP(op)                                                      \
-StateValue Pointer::op(const Pointer &rhs) const {                          \
-  /* Note that attrs are not compared. */                                   \
-  expr nondet = expr::mkFreshVar("nondet", true);                           \
-  m.state->addQuantVar(nondet);                                             \
-  return { expr::mkIf(getBid() == rhs.getBid(),                             \
-                      getOffset().op(rhs.getOffset()), nondet), true };     \
-}
-
-DEFINE_CMP(sle)
-DEFINE_CMP(slt)
-DEFINE_CMP(sge)
-DEFINE_CMP(sgt)
-DEFINE_CMP(ule)
-DEFINE_CMP(ult)
-DEFINE_CMP(uge)
-DEFINE_CMP(ugt)
-
-static expr inbounds(const Pointer &p, bool strict) {
-  if (isUndef(p.getOffset()))
-    return false;
-
-  // equivalent to offset >= 0 && offset <= block_size
-  // because block_size u<= 0x7FFF..FF
-  return strict ? p.getOffsetSizet().ult(p.blockSize()) :
-                  p.getOffsetSizet().ule(p.blockSize());
-}
-
-expr Pointer::inbounds(bool simplify_ptr, bool strict) {
-  if (!simplify_ptr)
-    return ::inbounds(*this, strict);
-
-  DisjointExpr<expr> ret(expr(false)), all_ptrs;
-  for (auto &[ptr_expr, domain] : DisjointExpr<expr>(p, true, true)) {
-    expr inb = ::inbounds(Pointer(m, ptr_expr), strict);
-    if (!inb.isFalse())
-      all_ptrs.add(ptr_expr, domain);
-    ret.add(move(inb), domain);
-  }
-
-  // trim set of valid ptrs
-  if (auto ptrs = all_ptrs())
-    p = *ptrs;
-  else
-    p = expr::mkUInt(0, totalBits());
-
-  return *ret();
-}
-
-expr Pointer::blockAlignment() const {
-  return getValue("blk_align", m.local_blk_align, m.non_local_blk_align,
-                   expr::mkUInt(0, 6), true);
-}
-
-expr Pointer::isBlockAligned(unsigned align, bool exact) const {
-  if (!exact && align == 1)
-    return true;
-
-  auto bits = ilog2(align);
-  expr blk_align = blockAlignment();
-  return exact ? blk_align == bits : blk_align.uge(bits);
-}
-
-expr Pointer::isAligned(unsigned align) {
-  if (align == 1)
-    return true;
-
-  auto offset = getOffset();
-  if (isUndef(offset))
-    return false;
-
-  auto bits = min(ilog2(align), bits_for_offset);
-
-  expr blk_align = isBlockAligned(align);
-
-  if (!observesAddresses() || (blk_align.isConst() && offset.isConst())) {
-    // This is stricter than checking getAddress(), but as addresses are not
-    // observed, program shouldn't be able to distinguish this from checking
-    // getAddress()
-#if 0
-    // TODO: recheck if this optimization is any useful..
-    auto zero = expr::mkUInt(0, bits);
-    auto newp = p.extract(totalBits() - 1, bits_for_ptrattrs + bits)
-                 .concat(zero);
-    if (bits_for_ptrattrs)
-      newp = newp.concat(getAttrs());
-    p = move(newp);
-    assert(!p.isValid() || p.bits() == totalBits());
-#endif
-    return { blk_align && offset.extract(bits - 1, 0) == 0 };
-  }
-
-  return getAddress().extract(bits - 1, 0) == 0;
-}
-
-static pair<expr, expr> is_dereferenceable(Pointer &p,
-                                           const expr &bytes_off,
-                                           const expr &bytes,
-                                           unsigned align, bool iswrite) {
-  expr block_sz = p.blockSize();
-  expr offset = p.getOffset();
-
-  // check that offset is within bounds and that arith doesn't overflow
-  expr cond = (offset + bytes_off).sextOrTrunc(bits_size_t).ule(block_sz);
-  cond &= offset.add_no_uoverflow(bytes_off);
-
-  cond &= p.isBlockAlive();
-  cond &= !p.isReadnone();
-
-  if (iswrite)
-    cond &= p.isWritable() && !p.isReadonly();
-
-  // try some constant folding; these are implied by the conditions above
-  if (bytes.ugt(block_sz).isTrue() ||
-      offset.sextOrTrunc(bits_size_t).uge(block_sz).isTrue() ||
-      isUndef(offset))
-    cond = false;
-
-  return { move(cond), p.isAligned(align) };
-}
-
-// When bytes is 0, pointer is always derefenceable
-AndExpr Pointer::isDereferenceable(const expr &bytes0, unsigned align,
-                                   bool iswrite) {
-  expr bytes_off = bytes0.zextOrTrunc(bits_for_offset);
-  expr bytes = bytes0.zextOrTrunc(bits_size_t);
-  DisjointExpr<expr> UB(expr(false)), is_aligned(expr(false)), all_ptrs;
-
-  for (auto &[ptr_expr, domain] : DisjointExpr<expr>(p, true, true)) {
-    Pointer ptr(m, ptr_expr);
-    auto [ub, aligned] = ::is_dereferenceable(ptr, bytes_off, bytes, align,
-                                              iswrite);
-
-    // record pointer if not definitely unfeasible
-    if (!ub.isFalse() && !aligned.isFalse() && !ptr.blockSize().isZero())
-      all_ptrs.add(ptr.release(), domain);
-
-    UB.add(move(ub), domain);
-    is_aligned.add(move(aligned), domain);
-  }
-
-  AndExpr exprs;
-  exprs.add(bytes == 0 || *UB());
-
-  // cannot store more bytes than address space
-  if (bytes0.bits() > bits_size_t)
-    exprs.add(bytes0.extract(bytes0.bits() - 1, bits_size_t) == 0);
-
-  // address must be always aligned regardless of access size
-  exprs.add(*is_aligned());
-
-  // trim set of valid ptrs
-  if (auto ptrs = all_ptrs())
-    p = *ptrs;
-  else
-    p = expr::mkUInt(0, totalBits());
-
-  return exprs;
-}
-
-AndExpr Pointer::isDereferenceable(uint64_t bytes, unsigned align,
-                                   bool iswrite) {
-  return isDereferenceable(expr::mkUInt(bytes, bits_size_t), align, iswrite);
-}
-
-// general disjoint check for unsigned integer
-// This function assumes that both begin + len don't overflow
-static expr disjoint(const expr &begin1, const expr &len1, const expr &begin2,
-                     const expr &len2) {
-  return begin1.uge(begin2 + len2) || begin2.uge(begin1 + len1);
-}
-
-// This function assumes that both begin + len don't overflow
-void Pointer::isDisjointOrEqual(const expr &len1, const Pointer &ptr2,
-                                const expr &len2) const {
-  auto off = getOffsetSizet();
-  auto off2 = ptr2.getOffsetSizet();
-  m.state->addUB(getBid() != ptr2.getBid() ||
-                 off == off2 ||
-                 disjoint(off, len1.zextOrTrunc(bits_size_t), off2,
-                          len2.zextOrTrunc(bits_size_t)));
-}
-
-expr Pointer::isBlockAlive() const {
-  // NULL block is dead
-  if (has_null_block && getBid().isZero())
-    return false;
-
-  auto bid = getShortBid();
-  expr nonnull(true);
-  if (has_null_block)
-    nonnull = bid != 0;
-
-  return mkIf_fold(isLocal(), load_bv(m.local_block_liveness, bid),
-                   load_bv(m.non_local_block_liveness, bid) && nonnull);
-}
-
-expr Pointer::getAllocType() const {
-  return getValue("blk_kind", m.local_blk_kind, m.non_local_blk_kind,
-                   expr::mkUInt(0, 2));
-}
-
-expr Pointer::isHeapAllocated() const {
-  assert(MALLOC == 2 && CXX_NEW == 3);
-  return getAllocType().extract(1, 1) == 1;
-}
-
-expr Pointer::refined(const Pointer &other) const {
-  // This refers to a block that was malloc'ed within the function
-  expr local = getAllocType() == other.getAllocType();
-  local &= blockSize() == other.blockSize();
-  local &= getOffset() == other.getOffset();
-  // Attributes are ignored at refinement.
-
-  // TODO: this induces an infinite loop
-  //local &= block_refined(other);
-
-  return expr::mkIf(isLocal(), move(local), *this == other)
-      && isBlockAlive().implies(other.isBlockAlive());
-}
-
-expr Pointer::fninputRefined(const Pointer &other, set<expr> &undef,
-                             bool is_byval_arg) const {
-  expr size = blockSize();
-  expr off = getOffsetSizet();
-  expr size2 = other.blockSize();
-  expr off2 = other.getOffsetSizet();
-
-  expr local
-    = expr::mkIf(isHeapAllocated(),
-                 other.isHeapAllocated() && off == off2 && size2.uge(size),
-
-                 // must maintain same dereferenceability before & after
-                 expr::mkIf(off.sle(-1),
-                            off == off2 && size2.uge(size),
-                            off2.sge(0) &&
-                              expr::mkIf(off.sle(size),
-                                         off2.sle(size2) && off2.uge(off) &&
-                                           (size2 - off2).uge(size - off),
-                                         off2.sgt(size2) && off == off2 &&
-                                           size2.uge(size))));
-  local = (other.isLocal() || other.isByval() || is_byval_arg) && local;
-
-  // TODO: this induces an infinite loop
-  // block_refined(other);
-
-  return expr::mkIf(isLocal(), local, *this == other)
-      && isBlockAlive().implies(other.isBlockAlive());
-}
-
-expr Pointer::isWritable() const {
-  auto bid = getShortBid();
-  expr non_local
-    = num_consts_src == 1 ? bid != has_null_block :
-        (num_consts_src ? bid.ugt(has_null_block + num_consts_src - 1) : true);
-  if (m.numNonlocals() > num_nonlocals_src + num_extra_nonconst_tgt)
-    non_local &= bid.ult(num_nonlocals_src + num_extra_nonconst_tgt);
-  return isLocal() || non_local;
-}
-
-expr Pointer::isByval() const {
-  auto this_bid = getShortBid();
-  expr non_local(false);
-  for (auto bid : m.byval_blks) {
-    non_local |= this_bid == bid;
-  }
-  return !isLocal() && non_local;
-}
-
-expr Pointer::isNocapture(bool simplify) const {
-  if (!has_nocapture)
-    return false;
-
-  // local pointers can't be no-capture
-  if (isLocal(simplify).isTrue())
-    return false;
-
-  return p.extract(0, 0) == 1;
-}
-
-expr Pointer::isReadonly() const {
-  if (!has_readonly)
-    return false;
-  return p.extract(has_nocapture, has_nocapture) == 1;
-}
-
-expr Pointer::isReadnone() const {
-  if (!has_readnone)
-    return false;
-  unsigned idx = (unsigned)has_nocapture + (unsigned)has_readonly;
-  return p.extract(idx, idx) == 1;
-}
-
-void Pointer::stripAttrs() {
-  p = p.extract(totalBits()-1, bits_for_ptrattrs)
-       .concat_zeros(bits_for_ptrattrs);
-}
-
-Pointer Pointer::mkNullPointer(const Memory &m) {
-  // Null pointer exists if either source or target uses it.
-  assert(has_null_block);
-  // A null pointer points to block 0 without any attribute.
-  return { m, 0, false };
-}
-
-expr Pointer::isNull() const {
-  if (!has_null_block)
-    return false;
-  return *this == mkNullPointer(m);
-}
-
-expr Pointer::isNonZero() const {
-  if (observesAddresses())
-    return getAddress() != 0;
-  return !isNull();
-}
-
-ostream& operator<<(ostream &os, const Pointer &p) {
-  if (p.isNull().isTrue())
-    return os << "null";
-
-#define P(field, fn)   \
-  if (field.isConst()) \
-    field.fn(os);      \
-  else                 \
-    os << field
-
-  os << "pointer(" << (p.isLocal().isTrue() ? "local" : "non-local")
-     << ", block_id=";
-  P(p.getBid(), printUnsigned);
-
-  os << ", offset=";
-  P(p.getOffset(), printSigned);
-
-  if (bits_for_ptrattrs && !p.getAttrs().isZero()) {
-    os << ", attrs=";
-    P(p.getAttrs(), printUnsigned);
-  }
-#undef P
-  return os << ')';
-}
-
 
 Memory::AliasSet::AliasSet(const Memory &m)
   : local(m.numLocals(), false), non_local(m.numNonlocals(), false) {}
@@ -859,6 +296,19 @@ int Memory::AliasSet::isFullUpToAlias(bool islocal) const {
       return -1;
   }
   return i - 1;
+}
+
+expr Memory::AliasSet::mayAlias(bool islocal, const expr &bid) const {
+  int upto = isFullUpToAlias(islocal);
+  if (upto >= 0)
+    return bid.ule(upto);
+
+  expr ret(false);
+  for (unsigned i = 0, e = size(islocal); i < e; ++i) {
+    if (mayAlias(islocal, i))
+      ret |= bid == i;
+  }
+  return ret;
 }
 
 bool Memory::AliasSet::mayAlias(bool islocal, unsigned bid) const {
@@ -1122,16 +572,18 @@ static set<expr> extract_possible_local_bids(Memory &m, const expr &eptr) {
   return ret;
 }
 
-unsigned Memory::nextNonlocalBid() {
-  return min(next_nonlocal_bid++, num_nonlocals_src-1);
-}
-
 unsigned Memory::numLocals() const {
   return state->isSource() ? num_locals_src : num_locals_tgt;
 }
 
 unsigned Memory::numNonlocals() const {
   return state->isSource() ? num_nonlocals_src : num_nonlocals;
+}
+
+expr Memory::isBlockAlive(const expr &bid, bool local) const {
+  return
+    load_bv(local ? local_block_liveness : non_local_block_liveness, bid) &&
+      (!local && has_null_block ? bid != 0 : true);
 }
 
 bool Memory::mayalias(bool local, unsigned bid0, const expr &offset0,
@@ -1150,7 +602,7 @@ bool Memory::mayalias(bool local, unsigned bid0, const expr &offset0,
 
   assert(!isUndef(offset0));
 
-  expr bid = expr::mkUInt(bid0, bits_shortbid());
+  expr bid = expr::mkUInt(bid0, Pointer::bitsShortBid());
   if (auto algn = (local ? local_blk_align : non_local_blk_align).lookup(bid)) {
     uint64_t blk_align;
     ENSURE(algn->isUInt(blk_align));
@@ -1493,7 +945,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           StateValue widesv;
           for (unsigned j = 0; j < bytes_per_load; j += bits_byte/8) {
-            auto ptr_uf = (ptr + i).shortPtr(st.alias.numMayAlias(true) == 0);
+            auto ptr_uf = (ptr + i).shortPtr(st.uf_uses_short_bid);
             Byte byte(*this, expr::mkUF(st.uf_name, { ptr_uf }, range));
             StateValue sv;
             if (type == DATA_INT) {
@@ -1587,6 +1039,9 @@ void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
   if (ptr) {
     data->alias = computeAliasing(*ptr, st_size, align, true);
     data->ptr.emplace(move(*ptr));
+    if (data->alias.numMayAlias(false) == 0 &&
+        data->alias.numMayAlias(true) == 0)
+      return;
   }
 
   data->align = align;
@@ -1616,26 +1071,24 @@ static expr mk_liveness_array() {
   return expr::mkInt(-1, num_nonlocals);
 }
 
-void Memory::mk_init_mem_val_axioms(const char *uf_name, bool allow_local) {
+void Memory::mk_init_mem_val_axioms(const char *uf_name, bool allow_local,
+                                    bool short_bid) {
   if (!does_ptr_mem_access)
     return;
 
   expr ptr
-    = expr::mkFreshVar("#ptr", expr::mkUInt(0, Pointer::totalBitsShort()));
+    = expr::mkFreshVar("#ptr",
+                       expr::mkUInt(0, Pointer::totalBitsShort(short_bid)));
   Byte byte(*this,
             expr::mkUF(uf_name, {ptr}, expr::mkUInt(0, Byte::bitsByte())));
 
   Pointer loadedptr = byte.ptr();
   expr bid = loadedptr.getShortBid();
   expr islocal = loadedptr.isLocal(false);
-  expr constr = bid.ule(num_nonlocals_src-1);
+  expr constr = bid.ule(numNonlocals()-1);
 
   if (allow_local && escaped_local_blks.numMayAlias(true) > 0) {
-    expr local = false;
-    for (unsigned i = 0; i < numLocals(); ++i) {
-      if (escaped_local_blks.mayAlias(true, i))
-        local |= bid == i;
-    }
+    expr local = escaped_local_blks.mayAlias(true, bid);
     constr = expr::mkIf(islocal, local, constr);
   } else {
     constr = !islocal && constr;
@@ -1650,20 +1103,18 @@ Memory::Memory(State &state) : state(&state), escaped_local_blks(*this) {
   if (memory_unused())
     return;
 
-  next_nonlocal_bid
-    = has_null_block + num_globals_src + num_ptrinputs + has_fncall;
-
   if (numNonlocals() > 0) {
     auto st = make_unique<MemStore>(*this, "init_mem");
     st->alias.setMayAliasUpTo(false, num_nonlocals_src - 1,
                               has_null_block + num_consts_src);
+    st->uf_uses_short_bid = true;
     store(nullopt, nullptr, 1u << 31, move(st));
 
     non_local_block_liveness = mk_liveness_array();
 
     // Non-local blocks cannot initially contain pointers to local blocks
     // and no-capture pointers.
-    mk_init_mem_val_axioms("init_mem", false);
+    mk_init_mem_val_axioms("init_mem", false, true);
   }
 
   if (numLocals() > 0) {
@@ -1686,15 +1137,9 @@ void Memory::mkAxioms(const Memory &tgt) const {
   if (memory_unused())
     return;
 
-  auto nonlocal_used = [&](unsigned bid) {
-    return bid < tgt.next_nonlocal_bid || bid >= num_nonlocals_src;
-  };
-
   // transformation can increase alignment
   unsigned align = ilog2(heap_block_alignment);
   for (unsigned bid = has_null_block; bid < num_nonlocals; ++bid) {
-    if (!nonlocal_used(bid))
-      continue;
     Pointer p(*this, bid, false);
     Pointer q(tgt, bid, false);
     auto p_align = p.blockAlignment();
@@ -1714,9 +1159,6 @@ void Memory::mkAxioms(const Memory &tgt) const {
   // Non-local blocks are disjoint.
   // Ignore null pointer block
   for (unsigned bid = has_null_block; bid < num_nonlocals; ++bid) {
-    if (!nonlocal_used(bid))
-      continue;
-
     Pointer p1(*this, bid, false);
     auto addr = p1.getAddress();
     auto sz = p1.blockSize();
@@ -1729,8 +1171,6 @@ void Memory::mkAxioms(const Memory &tgt) const {
 
     // disjointness constraint
     for (unsigned bid2 = bid + 1; bid2 < num_nonlocals; ++bid2) {
-      if (!nonlocal_used(bid2))
-        continue;
       Pointer p2(*this, bid2, false);
       disj &= p2.isBlockAlive()
                 .implies(disjoint(addr, sz, p2.getAddress(), p2.blockSize()));
@@ -1744,21 +1184,18 @@ void Memory::cleanGlobals() {
 }
 
 void Memory::resetGlobals() {
+  Pointer::resetGlobals();
   next_global_bid = has_null_block;
   next_local_bid = 0;
-  ptr_next_idx = 0;
-  next_ptr_input = 0;
   next_fn_memblock = 0;
 }
 
 void Memory::syncWithSrc(const Memory &src) {
   assert(src.state->isSource() && !state->isSource());
+  Pointer::resetGlobals();
   next_local_bid = 0;
-  ptr_next_idx = 0;
-  next_ptr_input = 0;
   // The bid of tgt global starts with num_nonlocals_src
   next_global_bid = num_nonlocals_src;
-  next_nonlocal_bid = src.next_nonlocal_bid;
 }
 
 void Memory::markByVal(unsigned bid) {
@@ -1767,21 +1204,22 @@ void Memory::markByVal(unsigned bid) {
 }
 
 expr Memory::mkInput(const char *name, const ParamAttrs &attrs) {
-  unsigned max_bid = has_null_block + num_globals_src + next_ptr_input++;
-  assert(max_bid < num_nonlocals_src);
-  Pointer p(*this, name, false, false, false, attr_to_bitvec(attrs));
+  Pointer p(*this, name, false, false, false, attrs);
   auto bid = p.getShortBid();
 
-  state->addAxiom(bid.ule(max_bid));
+  state->addAxiom(bid.ule(num_nonlocals_src-1));
 
-  AliasSet alias(*this);
-  alias.setMayAliasUpTo(false, max_bid);
+  if (!byval_blks.empty()) {
+    AliasSet alias(*this);
+    alias.setFullAlias(false);
 
-  for (auto byval_bid : byval_blks) {
-    state->addAxiom(bid != byval_bid);
-    alias.setNoAlias(false, byval_bid);
+    // FIXME: doesn't take future markByVal() into account
+    for (auto byval_bid : byval_blks) {
+      state->addAxiom(bid != byval_bid);
+      alias.setNoAlias(false, byval_bid);
+    }
+    ptr_alias.emplace(p.getBid(), move(alias));
   }
-  ptr_alias.emplace(p.getBid(), move(alias));
 
   return p.release();
 }
@@ -1801,8 +1239,7 @@ pair<expr, expr> Memory::mkUndefInput(const ParamAttrs &attrs) const {
                           one << var.zextOrTrunc(bits_for_offset));
     offset = undef.extract(bits_undef - 1, log_offset) | shl;
   }
-  Pointer p(*this, expr::mkUInt(0, bits_for_bid), offset,
-            attr_to_bitvec(attrs));
+  Pointer p(*this, expr::mkUInt(0, bits_for_bid), offset, attrs);
   return { p.release(), move(undef) };
 }
 
@@ -1815,33 +1252,20 @@ expr Memory::PtrInput::operator==(const PtrInput &rhs) const {
 expr Memory::mkFnRet(const char *name, const vector<PtrInput> &ptr_inputs) {
   bool has_local = escaped_local_blks.numMayAlias(true);
 
-  unsigned bits_bid = has_local ? bits_for_bid : bits_shortbid();
+  unsigned bits_bid = has_local ? bits_for_bid : Pointer::bitsShortBid();
   expr var
     = expr::mkFreshVar(name, expr::mkUInt(0, bits_bid + bits_for_offset));
   auto p_bid = var.extract(bits_bid + bits_for_offset - 1, bits_for_offset);
-  if (!has_local && ptr_has_local_bit())
+  if (!has_local && Pointer::hasLocalBit())
     p_bid = expr::mkUInt(0, 1).concat(p_bid);
   Pointer p(*this, p_bid, var.extract(bits_for_offset-1, 0));
+
   auto bid = p.getShortBid();
+  expr local = escaped_local_blks.mayAlias(true, bid);
 
-  set<expr> local;
-  if (has_local) {
-    int upto = escaped_local_blks.isFullUpToAlias(true);
-    if (upto >= 0) {
-      local.emplace(bid.ule(upto));
-    }
-    else {
-      for (unsigned i = 0, e = escaped_local_blks.size(true); i < e; ++i) {
-        if (escaped_local_blks.mayAlias(true, i))
-          local.emplace(bid == i);
-      }
-    }
-  }
-
-  unsigned max_nonlocal_bid = nextNonlocalBid();
-  expr nonlocal = bid.ule(max_nonlocal_bid);
+  expr nonlocal = bid.ule(numNonlocals());
   auto alias = escaped_local_blks;
-  alias.setMayAliasUpTo(false, max_nonlocal_bid);
+  alias.setFullAlias(false);
 
   for (auto byval_bid : byval_blks) {
     nonlocal &= bid != byval_bid;
@@ -1857,8 +1281,7 @@ expr Memory::mkFnRet(const char *name, const vector<PtrInput> &ptr_inputs) {
     }
   }
 
-  state->addAxiom(
-    input || expr::mkIf(p.isLocal(), expr::mk_or(local), nonlocal));
+  state->addAxiom(input || expr::mkIf(p.isLocal(), local, nonlocal));
   return p.release();
 }
 
@@ -1901,25 +1324,36 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
   st.empty = false;
 
   {
-    string uf_name = "init_fn_mem#" + to_string(next_fn_memblock++);
-    mk_init_mem_val_axioms(uf_name.c_str(), true);
+    st.uf_name = fnname + "#mem#" + to_string(next_fn_memblock++);
+    AliasSet full_alias(*this);
 
     if (ptr_inputs) {
       for (auto &ptr_in : *ptr_inputs) {
         if (!ptr_in.val.non_poison.isFalse()) {
           Pointer ptr(*this, ptr_in.val.value);
-          auto mem = make_unique<MemStore>(*this, uf_name.c_str());
+          auto mem = make_unique<MemStore>(*this, st.uf_name.c_str());
           mem->alias = computeAliasing(ptr, 1, 1, true);
+          full_alias.unionWith(mem->alias);
           store(ptr, nullptr, 1u << 31, move(mem));
         }
       }
     } else {
-      auto mem = make_unique<MemStore>(*this, uf_name.c_str());
+      auto mem = make_unique<MemStore>(*this, st.uf_name.c_str());
       mem->alias = escaped_local_blks;
-      mem->alias.setMayAliasUpTo(false, next_nonlocal_bid - 1,
+      mem->alias.setMayAliasUpTo(false, numNonlocals() - 1,
                                  has_null_block + num_consts_src);
+      full_alias = mem->alias;
       store(nullopt, nullptr, 1u << 31, move(mem));
     }
+
+    st.uf_uses_short_bid = full_alias.numMayAlias(true) > 0;
+    for (auto store = store_seq_head; true; store = store->next) {
+      if (store->uf_name != st.uf_name)
+        break;
+      store->uf_uses_short_bid = st.uf_uses_short_bid;
+    }
+
+    mk_init_mem_val_axioms(st.uf_name.c_str(), true, st.uf_uses_short_bid);
   }
   st.store_seq_head = store_seq_head;
 
@@ -1932,7 +1366,7 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
       if (ptr_inputs) {
         may_free = false;
         for (auto &ptr_in : *ptr_inputs) {
-          if (!ptr_in.byval && bid < next_nonlocal_bid)
+          if (!ptr_in.byval && bid < num_nonlocals_src)
             may_free |= Pointer(*this, ptr_in.val.value).getBid() == bid;
         }
       }
@@ -1979,7 +1413,7 @@ static expr disjoint_local_blocks(const Memory &m, const expr &addr,
   auto one = expr::mkUInt(1, 1);
   auto zero = expr::mkUInt(0, bits_for_offset);
   for (auto &[sbid, addr0] : blk_addr) {
-    Pointer p2(m, prepend_if(one, expr(sbid), ptr_has_local_bit()), zero);
+    Pointer p2(m, prepend_if(one, expr(sbid), Pointer::hasLocalBit()), zero);
     disj &= p2.isBlockAlive()
               .implies(disjoint(addr, sz, p2.getAddress(), p2.blockSize()));
   }
@@ -2190,35 +1624,9 @@ StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,
   }
 
   bool is_ptr = type.isPtrType();
-  auto val = type.fromInt(load(ptr, bytecount, undef, align,
+  return type.fromInt(load(ptr, bytecount, undef, align,
                                is_ptr ? DATA_PTR : DATA_INT)
-                          .trunc(type.bits(), type.np_bits()));
-
-  // partial order reduction for fresh pointers
-  // can alias [0, next_ptr++] U extra_tgt_consts
-  if (is_ptr && !val.non_poison.isFalse()) {
-    optional<unsigned> max_bid;
-    for (auto &p : all_leaf_ptrs(*this, val.value)) {
-      auto islocal = p.isLocal();
-      auto bid = p.getShortBid();
-      if (!islocal.isTrue() && !bid.isConst()) {
-        auto [I, inserted] = ptr_alias.try_emplace(p.getBid(), *this);
-        if (inserted) {
-          if (!max_bid)
-            max_bid = nextNonlocalBid();
-          I->second.setMayAliasUpTo(false, *max_bid);
-          for (unsigned i = num_nonlocals_src; i < numNonlocals(); ++i) {
-            I->second.setMayAlias(false, i);
-          }
-          state->addPre(islocal || bid.ule(*max_bid) ||
-                        (num_extra_nonconst_tgt ? bid.uge(num_nonlocals_src)
-                                                : false));
-        }
-      }
-    }
-  }
-
-  return val;
+                        .trunc(type.bits(), type.np_bits()));
 }
 
 pair<StateValue, AndExpr>
@@ -2391,6 +1799,7 @@ tuple<expr, Pointer, set<expr>>
 Memory::refined(const Memory &other, bool fncall,
                 const vector<PtrInput> *set_ptrs,
                 const vector<PtrInput> *set_ptrs_other) const {
+  // TODO: needs to consider local escaped blocks
   if (num_nonlocals <= has_null_block)
     return { true, Pointer(*this, expr()), {} };
 
@@ -2481,7 +1890,56 @@ Memory::refined(const Memory &other, bool fncall,
     }
   }
 
-  // TODO: check that written locs in src are refined by tgt
+  if (!store_seq_head)
+    return { move(ret), move(ptr), move(undef_vars) };
+
+  // check that written locs in src are refined by tgt
+  AliasSet full_alias(*this);
+  if (fncall) {
+
+  } else {
+    full_alias.setFullAlias(false);
+  }
+  map<tuple<const MemStore*, const Pointer*, const AliasSet*>,
+      vector<StateValue>> vals;
+  vector<tuple<const MemStore*, const Pointer*, const AliasSet*>> todo
+    = { { store_seq_head, &ptr, &full_alias } };
+  set<tuple<const MemStore*, const Pointer*, const AliasSet*>> seen;
+
+  do {
+    auto key = todo.back();
+    auto &st = *get<0>(key);
+    auto &ptr = *get<1>(key);
+    auto &alias = *get<2>(key);
+
+    // TODO: don't process children if store matches perfectly or full write
+    bool has_all_deps = true;
+    if (st.next && !vals.count({st.next, &ptr, &alias})) {
+      todo.emplace_back(st.next, &ptr, &alias);
+      has_all_deps = false;
+    }
+    if (st.els && !vals.count({st.els, &ptr, &alias})) {
+      todo.emplace_back(st.els, &ptr, &alias);
+      has_all_deps = false;
+    }
+    if (st.ptr_src && !vals.count({st.next, &*st.ptr_src, &st.src_alias})) {
+      assert(st.next);
+      todo.emplace_back(st.next, &*st.ptr_src, &st.src_alias);
+      has_all_deps = false;
+    }
+
+    if (!has_all_deps)
+      continue;
+    todo.pop_back();
+
+    auto [I, inserted] = vals.try_emplace(key);
+    ////auto &val = I->second;
+    if (!inserted)
+      continue;
+
+    // TODO: traverse tgt stores
+
+  } while (!todo.empty());
 
 #if 0
   unsigned bid = has_null_block + skip_constants * num_consts_src;
@@ -2573,7 +2031,7 @@ void Memory::escapeLocalPtr(const expr &ptr) {
     if (bid_expr.isUInt(bid)) {
       if (bid < next_local_bid)
         escaped_local_blks.setMayAlias(true, bid);
-    } else if (is_initial_memblock(bid_expr)) {
+    } else if (isInitialMemBlock(bid_expr)) {
       // initial non local block bytes don't contain local pointers.
       continue;
     } else {
@@ -2610,8 +2068,6 @@ Memory Memory::mkIf(const expr &cond, const Memory &then, const Memory &els) {
       ret.ptr_alias.emplace(expr, alias)
          .first->second.unionWith(I->second);
   }
-
-  ret.next_nonlocal_bid = max(then.next_nonlocal_bid, els.next_nonlocal_bid);
   return ret;
 }
 

@@ -97,6 +97,7 @@ set(IR_SRCS
   ir/init.cpp
   ir/instr.cpp
   ir/memory.cpp
+  ir/pointer.cpp
   ir/precondition.cpp
   ir/state.cpp
   ir/state_value.cpp

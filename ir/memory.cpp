@@ -1274,12 +1274,10 @@ expr Memory::mkFnRet(const char *name, const vector<PtrInput> &ptr_inputs) {
   ptr_alias.emplace(p.getBid(), move(alias));
 
   expr input = false;
-  if (ptr_inputs) {
-    for (auto &ptr_in : *ptr_inputs) {
-      input |= ptr_in.val.non_poison &&
-               p.getBid() == Pointer(*this, ptr_in.val.value).getBid();
+  for (auto &ptr_in : ptr_inputs) {
+    input |= ptr_in.val.non_poison &&
+             p.getBid() == Pointer(*this, ptr_in.val.value).getBid();
     }
-  }
 
   state->addAxiom(input || expr::mkIf(p.isLocal(), local, nonlocal));
   return p.release();
@@ -1289,6 +1287,8 @@ Memory::CallState Memory::CallState::mkIf(const expr &cond,
                                           const CallState &then,
                                           const CallState &els) {
   CallState ret;
+#if 0
+FIXME
   for (unsigned i = 0, e = then.non_local_block_val.size(); i != e; ++i) {
     ret.non_local_block_val.emplace_back(
       expr::mkIf(cond, then.non_local_block_val[i],
@@ -1297,6 +1297,7 @@ Memory::CallState Memory::CallState::mkIf(const expr &cond,
   ret.non_local_block_liveness
     = expr::mkIf(cond, then.non_local_block_liveness,
                  els.non_local_block_liveness);
+#endif
   return ret;
 }
 

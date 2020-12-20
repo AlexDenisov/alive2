@@ -3,7 +3,7 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
-#include <climits>
+#include <compare>
 #include <cstdint>
 #include <ostream>
 #include <set>
@@ -334,10 +334,7 @@ public:
   friend std::ostream &operator<<(std::ostream &os, const expr &e);
 
   // for container use only
-  auto operator<=>(const expr &rhs) const {
-    return
-      (isValid() ? id() : UINT_MAX) <=> (rhs.isValid() ? rhs.id() : UINT_MAX);
-  }
+  std::strong_ordering operator<=>(const expr &rhs) const;
   unsigned id() const;
   unsigned hash() const;
 

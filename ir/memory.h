@@ -223,9 +223,7 @@ public:
 
   class CallState {
     const MemStore *store_seq_head;
-    std::string uf_name;
-    smt::expr non_local_block_liveness;
-    smt::expr non_local_liveness_var;
+    smt::expr non_local_liveness;
     bool empty = true;
 
   public:

@@ -1280,10 +1280,9 @@ FIXME
       expr::mkIf(cond, then.non_local_block_val[i],
                  els.non_local_block_val[i]));
   }
-  ret.non_local_block_liveness
-    = expr::mkIf(cond, then.non_local_block_liveness,
-                 els.non_local_block_liveness);
 #endif
+  ret.non_local_liveness = expr::mkIf(cond, then.non_local_liveness,
+                                      els.non_local_liveness);
   return ret;
 }
 
@@ -1298,9 +1297,9 @@ expr Memory::CallState::operator==(const CallState &rhs) const {
   for (unsigned i = 0, e = non_local_block_val.size(); i != e; ++i) {
     ret &= non_local_block_val[i] == rhs.non_local_block_val[i];
   }
-  if (non_local_liveness_var.isValid() && st.non_local_liveness_var.isValid())
-    ret &= non_local_liveness_var == st.non_local_liveness_var;
 #endif
+  if (non_local_liveness.isValid() && rhs.non_local_liveness.isValid())
+    ret &= non_local_liveness == rhs.non_local_liveness;
   return ret;
 }
 
@@ -1311,28 +1310,28 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
   st.empty = false;
 
   {
-    st.uf_name = fnname + "#mem#" + to_string(next_fn_memblock++);
+    auto uf_name = fnname + "#mem#" + to_string(next_fn_memblock++);
     AliasSet full_alias(*this);
 
     if (ptr_inputs) {
       for (auto &ptr_in : *ptr_inputs) {
         if (!ptr_in.val.non_poison.isFalse()) {
           Pointer ptr(*this, ptr_in.val.value);
-          MemStore mem(*this, st.uf_name.c_str());
+          MemStore mem(*this, uf_name.c_str());
           mem.alias = computeAliasing(ptr, 1, 1, true);
           full_alias.unionWith(mem.alias);
           store(ptr, nullptr, 1u << 31, move(mem));
         }
       }
     } else {
-      MemStore mem(*this, st.uf_name.c_str());
+      MemStore mem(*this, uf_name.c_str());
       mem.alias = escaped_local_blks;
       mem.alias.setMayAliasUpTo(false, numNonlocals() - 1,
                                 has_null_block + num_consts_src);
       full_alias = mem.alias;
       store(nullopt, nullptr, 1u << 31, move(mem));
     }
-    mk_init_mem_val_axioms(st.uf_name.c_str(), true, false);
+    mk_init_mem_val_axioms(uf_name.c_str(), true, false);
   }
   st.store_seq_head = store_seq_head;
 
@@ -1355,17 +1354,9 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
                                one << expr::mkUInt(bid, num_nonlocals));
     }
 
-    if (mask.isAllOnes()) {
-      st.non_local_block_liveness = non_local_block_liveness;
-    } else {
-      st.non_local_liveness_var
-        = expr::mkFreshVar("blk_liveness", mk_liveness_array());
-      // functions can free an object, but cannot bring a dead one back to live
-      st.non_local_block_liveness
-        = non_local_block_liveness & (st.non_local_liveness_var | mask);
-    }
-  } else {
-    st.non_local_block_liveness = non_local_block_liveness;
+    if (!mask.isAllOnes())
+      st.non_local_liveness
+        = expr::mkFreshVar("blk_liveness", mk_liveness_array()) | mask;
   }
 
   if (numLocals() && !nofree) {
@@ -1375,13 +1366,10 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
   return st;
 }
 
-void Memory::setState(const Memory::CallState &st) {
+void Memory::setState(const CallState &st) {
   store_seq_head = st.store_seq_head;
-  non_local_block_liveness = st.non_local_block_liveness;
-  /* TODO: needs program alignment when reusing fn calls across src/tgt?
-  if (st.local_liveness_var.isValid())
-    local_block_liveness = local_block_liveness & st.local_block_liveness;
-  */
+  if (st.non_local_liveness.isValid())
+    non_local_block_liveness = non_local_block_liveness & st.non_local_liveness;
 }
 
 static expr disjoint_local_blocks(const Memory &m, const expr &addr,

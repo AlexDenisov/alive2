@@ -225,9 +225,7 @@ public:
     const MemStore *store_seq_head;
     std::string uf_name;
     smt::expr non_local_block_liveness;
-    smt::expr local_block_liveness;
     smt::expr non_local_liveness_var;
-    smt::expr local_liveness_var;
     bool empty = true;
 
   public:

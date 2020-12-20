@@ -524,8 +524,8 @@ void Memory::MemStore::print(std::ostream &os) const {
         os << "\nFN: " << st->uf_name;
         break;
       case COPY:
-        os << "\nSRC PTR: " << *st->ptr_src;
-        os << "\nSRC ALIAS: ";
+        os << "\nSRC PTR: " << *st->ptr_src
+           << "\nSRC ALIAS: ";
         st->src_alias.print(os);
         break;
       case COND:
@@ -731,7 +731,6 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       vector<StateValue>> vals;
   vector<tuple<const MemStore*, const Pointer*, const AliasSet*>> todo
     = { { store_seq_head, &ptr, &alias } };
-  set<tuple<const MemStore*, const Pointer*, const AliasSet*>> seen;
 
   do {
     auto key = todo.back();
@@ -875,11 +874,6 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
               value.non_poison = (st.value.non_poison << diff)
                                  .extract(bits - 1, bits - bytes_per_load * 8);
             }
-
-            // optimization: if all ones, output is guaranteed to be false
-            // regardless of which byte is read
-            if (value.non_poison.isAllOnes())
-              value.non_poison = expr::mkInt(-1, bytes_per_load * 8);
           }
 
           assert(!st.value.isValid() || !(*st.ptr)().isValid() ||

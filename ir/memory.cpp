@@ -443,7 +443,7 @@ void Memory::AliasSet::print(ostream &os) const {
 }
 
 
-vector<unique_ptr<Memory::MemStore>> Memory::mem_store_holder;
+set<Memory::MemStore> Memory::mem_store_holder;
 
 Memory::MemStore::MemStore(const Pointer &src, const expr *size,
                            unsigned align_src)
@@ -455,23 +455,24 @@ Memory::MemStore::MemStore(const Pointer &src, const expr *size,
                  .computeAliasing(src, st_size, align_src, false);
 }
 
-Memory::MemStore* Memory::MemStore::mkIf(const expr &cond, MemStore *then,
-                                         MemStore *els) {
-  if (!then)
-    return els;
-  if (!els)
+const Memory::MemStore*
+Memory::MemStore::mkIf(const expr &cond, const MemStore *then,
+                       const MemStore *els) {
+  if (then == els)
     return then;
 
-  auto st = make_unique<MemStore>(COND);
-  st->size.emplace(cond);
-  st->next = then;
-  st->els = els;
-  st->alias = then->alias;
-  st->alias.setFullAlias(false);
-  st->alias.setFullAlias(true);
-  auto ret = st.get();
-  mem_store_holder.emplace_back(move(st));
-  return ret;
+  MemStore st(COND);
+  st.size.emplace(cond);
+  st.next = then;
+  st.els = els;
+  st.alias = then ? then->alias : els->alias;
+  st.alias.setFullAlias(false);
+  st.alias.setFullAlias(true);
+  return &*mem_store_holder.emplace(move(st)).first;
+}
+
+bool Memory::MemStore::isInitBlock() const {
+  return uf_name == "init_mem";
 }
 
 void Memory::MemStore::print(std::ostream &os) const {
@@ -541,13 +542,6 @@ void Memory::MemStore::print(std::ostream &os) const {
       todo.push_back(st->next);
     os << "\n\n-----------------------------------------------------------\n";
   } while (!todo.empty());
-}
-
-bool Memory::MemStore::operator<(const MemStore &rhs) const {
-  return tie(ptr, size, value, ptr_src, uf_name, alias, src_alias, align, undef,
-             next, els) <
-         tie(rhs.ptr, rhs.size, rhs.value, rhs.ptr_src, rhs.uf_name, rhs.alias,
-             rhs.src_alias, rhs.align, rhs.undef, rhs.next, rhs.els);
 }
 
 
@@ -945,7 +939,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           StateValue widesv;
           for (unsigned j = 0; j < bytes_per_load; j += bits_byte/8) {
-            auto ptr_uf = (ptr + i).shortPtr(st.uf_uses_short_bid);
+            auto ptr_uf = (ptr + i).shortPtr(st.isInitBlock());
             Byte byte(*this, expr::mkUF(st.uf_name, { ptr_uf }, range));
             StateValue sv;
             if (type == DATA_INT) {
@@ -1024,34 +1018,33 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 }
 
 void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
-                   unique_ptr<MemStore> &&data) {
-  if (data->type == MemStore::PTR_VAL && !data->value.non_poison.isFalse())
-    escapeLocalPtr(data->value.value);
+                   MemStore &&data) {
+  if (data.type == MemStore::PTR_VAL && !data.value.non_poison.isFalse())
+    escapeLocalPtr(data.value.value);
 
   uint64_t st_size = 1;
   if (bytes) {
     bytes->isUInt(st_size);
-    data->size = *bytes;
+    data.size = *bytes;
     if (st_size == 0)
       return;
   }
 
   if (ptr) {
-    data->alias = computeAliasing(*ptr, st_size, align, true);
-    data->ptr.emplace(move(*ptr));
-    if (data->alias.numMayAlias(false) == 0 &&
-        data->alias.numMayAlias(true) == 0)
+    data.alias = computeAliasing(*ptr, st_size, align, true);
+    data.ptr.emplace(move(*ptr));
+    if (data.alias.numMayAlias(false) == 0 &&
+        data.alias.numMayAlias(true) == 0)
       return;
   }
 
-  data->align = align;
-  data->next = store_seq_head;
-  store_seq_head = data.get();
-  mem_store_holder.emplace_back(move(data));
+  data.align = align;
+  data.next = store_seq_head;
+  store_seq_head = &*mem_store_holder.emplace(move(data)).first;
 }
 
 void Memory::store(optional<Pointer> ptr, unsigned bytes, unsigned align,
-                   unique_ptr<MemStore> &&data) {
+                   MemStore &&data) {
   if (bytes != 0) {
     auto sz = expr::mkUInt(bytes, bits_size_t);
     store(move(ptr), &sz, align, move(data));
@@ -1104,10 +1097,9 @@ Memory::Memory(State &state) : state(&state), escaped_local_blks(*this) {
     return;
 
   if (numNonlocals() > 0) {
-    auto st = make_unique<MemStore>(*this, "init_mem");
-    st->alias.setMayAliasUpTo(false, num_nonlocals_src - 1,
-                              has_null_block + num_consts_src);
-    st->uf_uses_short_bid = true;
+    MemStore st(*this, "init_mem");
+    st.alias.setMayAliasUpTo(false, num_nonlocals_src - 1,
+                             has_null_block + num_consts_src);
     store(nullopt, nullptr, 1u << 31, move(st));
 
     non_local_block_liveness = mk_liveness_array();
@@ -1332,29 +1324,21 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
       for (auto &ptr_in : *ptr_inputs) {
         if (!ptr_in.val.non_poison.isFalse()) {
           Pointer ptr(*this, ptr_in.val.value);
-          auto mem = make_unique<MemStore>(*this, st.uf_name.c_str());
-          mem->alias = computeAliasing(ptr, 1, 1, true);
-          full_alias.unionWith(mem->alias);
+          MemStore mem(*this, st.uf_name.c_str());
+          mem.alias = computeAliasing(ptr, 1, 1, true);
+          full_alias.unionWith(mem.alias);
           store(ptr, nullptr, 1u << 31, move(mem));
         }
       }
     } else {
-      auto mem = make_unique<MemStore>(*this, st.uf_name.c_str());
-      mem->alias = escaped_local_blks;
-      mem->alias.setMayAliasUpTo(false, numNonlocals() - 1,
-                                 has_null_block + num_consts_src);
-      full_alias = mem->alias;
+      MemStore mem(*this, st.uf_name.c_str());
+      mem.alias = escaped_local_blks;
+      mem.alias.setMayAliasUpTo(false, numNonlocals() - 1,
+                                has_null_block + num_consts_src);
+      full_alias = mem.alias;
       store(nullopt, nullptr, 1u << 31, move(mem));
     }
-
-    st.uf_uses_short_bid = full_alias.numMayAlias(true) > 0;
-    for (auto store = store_seq_head; true; store = store->next) {
-      if (store->uf_name != st.uf_name)
-        break;
-      store->uf_uses_short_bid = st.uf_uses_short_bid;
-    }
-
-    mk_init_mem_val_axioms(st.uf_name.c_str(), true, st.uf_uses_short_bid);
+    mk_init_mem_val_axioms(st.uf_name.c_str(), true, false);
   }
   st.store_seq_head = store_seq_head;
 
@@ -1577,14 +1561,14 @@ void Memory::store(const Pointer &ptr, unsigned offset, StateValue &&v,
 
   } else if (type.isPtrType()) {
     store(ptr + offset, bits_program_pointer / 8, align,
-          make_unique<MemStore>(MemStore::PTR_VAL, move(v), undef_vars));
+          MemStore(MemStore::PTR_VAL, move(v), undef_vars));
 
   } else {
     unsigned bits = round_up(v.bits(), 8);
     auto val = v.zextOrTrunc(bits);
     store(ptr + offset, bits / 8, align,
-          make_unique<MemStore>(MemStore::INT_VAL,
-                                type.toInt(*state, move(val)), undef_vars));
+          MemStore(MemStore::INT_VAL, type.toInt(*state, move(val)),
+                   undef_vars));
   }
 }
 
@@ -1658,7 +1642,7 @@ void Memory::memset(const expr &p, const StateValue &val, const expr &bytesize,
     state->addUB(ptr.isDereferenceable(bytesize, align, true));
 
   store(ptr, &bytesize, align,
-        make_unique<MemStore>(MemStore::CONST, StateValue(val), undef_vars));
+        MemStore(MemStore::CONST, StateValue(val), undef_vars));
 }
 
 void Memory::memcpy(const expr &d, const expr &s, const expr &bytesize,
@@ -1675,12 +1659,11 @@ void Memory::memcpy(const expr &d, const expr &s, const expr &bytesize,
   if ((src == dst).isTrue())
     return;
 
-  store(dst, &bytesize, align_dst,
-        make_unique<MemStore>(src, &bytesize, align_src));
+  store(dst, &bytesize, align_dst, MemStore(src, &bytesize, align_src));
 }
 
 void Memory::copy(const Pointer &src, const Pointer &dst) {
-  store(dst, nullptr, 1, make_unique<MemStore>(src, nullptr, 1));
+  store(dst, nullptr, 1, MemStore(src, nullptr, 1));
 }
 
 expr Memory::ptr2int(const expr &ptr) const {

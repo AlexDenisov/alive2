@@ -543,10 +543,6 @@ void Pointer::resetGlobals() {
   ptr_next_idx = 0;
 }
 
-bool Pointer::operator<(const Pointer &rhs) const {
-  return p < rhs.p;
-}
-
 ostream& operator<<(ostream &os, const Pointer &p) {
   if (p.isNull().isTrue())
     return os << "null";

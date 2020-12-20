@@ -132,8 +132,7 @@ public:
 
   static void resetGlobals();
 
-  // for container use only
-  bool operator<(const Pointer &rhs) const;
+  auto operator<=>(const Pointer &rhs) const { return p <=> rhs.p; }
 
   friend std::ostream& operator<<(std::ostream &os, const Pointer &p);
 };

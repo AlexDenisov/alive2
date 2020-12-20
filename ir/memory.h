@@ -129,13 +129,12 @@ class Memory {
     StateValue value;
     std::optional<Pointer> ptr_src; // for COPY
     std::string uf_name; // for FN
-    bool uf_uses_short_bid;
 
     AliasSet alias;
     AliasSet src_alias;
     unsigned align = 1u << 31;
     std::set<smt::expr> undef;
-    MemStore *next = nullptr, *els = nullptr;
+    const MemStore *next = nullptr, *els = nullptr;
 
     // regular int/ptr store
     MemStore(Type type, StateValue &&value = {},
@@ -149,17 +148,19 @@ class Memory {
     MemStore(const Memory &m, const char *uf_name)
       : type(FN), uf_name(uf_name), alias(m) {}
 
-    static MemStore* mkIf(const smt::expr &cond, MemStore *then, MemStore *els);
+    static const MemStore* mkIf(const smt::expr &cond, const MemStore *then,
+                                const MemStore *els);
+
+    bool isInitBlock() const;
 
     void print(std::ostream &os) const;
 
-    // for container use only
-    bool operator<(const MemStore &rhs) const;
+    auto operator<=>(const MemStore &rhs) const = default;
   };
 
   // DAG of memory stores over the CFG
-  MemStore *store_seq_head = nullptr;
-  static std::vector<std::unique_ptr<MemStore>> mem_store_holder;
+  const MemStore *store_seq_head = nullptr;
+  static std::set<MemStore> mem_store_holder;
 
   smt::expr non_local_block_liveness; // BV w/ 1 bit per bid (1 if live)
   smt::expr local_block_liveness;
@@ -202,9 +203,9 @@ class Memory {
                   std::set<smt::expr> &undef, unsigned align);
 
   void store(std::optional<Pointer> ptr, const smt::expr *bytes, unsigned align,
-             std::unique_ptr<MemStore> &&data);
+             MemStore &&data);
   void store(std::optional<Pointer> ptr, unsigned bytes, unsigned align,
-             std::unique_ptr<MemStore> &&data);
+             MemStore &&data);
   void store(const Pointer &ptr, unsigned offset, StateValue &&v,
              const Type &type, unsigned align,
              const std::set<smt::expr> &undef_vars);
@@ -221,14 +222,13 @@ public:
   };
 
   class CallState {
-    MemStore *store_seq_head;
+    const MemStore *store_seq_head;
     std::string uf_name;
     smt::expr non_local_block_liveness;
     smt::expr local_block_liveness;
     smt::expr non_local_liveness_var;
     smt::expr local_liveness_var;
     bool empty = true;
-    bool uf_uses_short_bid;
 
   public:
     static CallState mkIf(const smt::expr &cond, const CallState &then,

@@ -3,7 +3,6 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
-#include <compare>
 #include <cstdint>
 #include <ostream>
 #include <set>
@@ -334,7 +333,12 @@ public:
   friend std::ostream &operator<<(std::ostream &os, const expr &e);
 
   // for container use only
-  std::strong_ordering operator<=>(const expr &rhs) const;
+  auto operator<=>(const expr &rhs) const {
+    auto lid = isValid() ? id() : 0;
+    auto rid = rhs.isValid() ? rhs.id() : 0;
+    return
+      std::make_pair(isValid(), lid) <=> std::make_pair(rhs.isValid(), rid);
+  }
   unsigned id() const;
   unsigned hash() const;
 

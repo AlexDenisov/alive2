@@ -686,8 +686,8 @@ end:
   if (I != ptr_alias.end())
     aliasing.intersectWith(I->second);
 
-  alias_info.computeAccessStats();
-  return alias_info;
+  aliasing.computeAccessStats();
+  return aliasing;
 }
 
 StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
@@ -1012,7 +1012,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 }
 
 void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
-                   MemStore &&data) {
+                   MemStore &&data, bool alias_write) {
   if (data.type == MemStore::PTR_VAL && !data.value.non_poison.isFalse())
     escapeLocalPtr(data.value.value);
 
@@ -1025,7 +1025,7 @@ void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
   }
 
   if (ptr) {
-    data.alias = computeAliasing(*ptr, st_size, align, true);
+    data.alias = computeAliasing(*ptr, st_size, align, alias_write);
     data.ptr.emplace(move(*ptr));
     if (data.alias.numMayAlias(false) == 0 &&
         data.alias.numMayAlias(true) == 0)
@@ -1038,10 +1038,10 @@ void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
 }
 
 void Memory::store(optional<Pointer> ptr, unsigned bytes, unsigned align,
-                   MemStore &&data) {
+                   MemStore &&data, bool alias_write) {
   if (bytes != 0) {
     auto sz = expr::mkUInt(bytes, bits_size_t);
-    store(move(ptr), &sz, align, move(data));
+    store(move(ptr), &sz, align, move(data), alias_write);
   }
 }
 
@@ -1539,7 +1539,7 @@ unsigned Memory::getStoreByteSize(const Type &ty) {
 
 void Memory::store(const Pointer &ptr, unsigned offset, StateValue &&v,
                    const Type &type, unsigned align,
-                   const set<expr> &undef_vars) {
+                   const set<expr> &undef_vars, bool alias_write) {
   auto aty = type.getAsAggregateType();
   if (aty && !isNonPtrVector(type)) {
     unsigned byteofs = 0;
@@ -1548,21 +1548,21 @@ void Memory::store(const Pointer &ptr, unsigned offset, StateValue &&v,
       if (child.bits() == 0)
         continue;
       store(ptr, offset + byteofs, aty->extract(v, i), child,
-            gcd(align, offset + byteofs), undef_vars);
+            gcd(align, offset + byteofs), undef_vars, alias_write);
       byteofs += getStoreByteSize(child);
     }
     assert(byteofs == getStoreByteSize(type));
 
   } else if (type.isPtrType()) {
     store(ptr + offset, bits_program_pointer / 8, align,
-          MemStore(MemStore::PTR_VAL, move(v), undef_vars));
+          MemStore(MemStore::PTR_VAL, move(v), undef_vars), alias_write);
 
   } else {
     unsigned bits = round_up(v.bits(), 8);
     auto val = v.zextOrTrunc(bits);
     store(ptr + offset, bits / 8, align,
           MemStore(MemStore::INT_VAL, type.toInt(*state, move(val)),
-                   undef_vars));
+                   undef_vars), alias_write);
   }
 }
 
@@ -1572,10 +1572,10 @@ void Memory::store(const expr &p, const StateValue &v, const Type &type,
   Pointer ptr(*this, p);
 
   // initializer stores are ok by construction
-  if (!state->isInitializationPhase())
+  bool init = state->isInitializationPhase();
+  if (!init)
     state->addUB(ptr.isDereferenceable(getStoreByteSize(type), align, true));
-
-  store(ptr, 0, StateValue(v), type, align, undef_vars);
+  store(ptr, 0, StateValue(v), type, align, undef_vars, !init);
 }
 
 StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,

@@ -203,12 +203,12 @@ class Memory {
                   std::set<smt::expr> &undef, unsigned align);
 
   void store(std::optional<Pointer> ptr, const smt::expr *bytes, unsigned align,
-             MemStore &&data);
+             MemStore &&data, bool alias_write = true);
   void store(std::optional<Pointer> ptr, unsigned bytes, unsigned align,
-             MemStore &&data);
+             MemStore &&data, bool alias_write);
   void store(const Pointer &ptr, unsigned offset, StateValue &&v,
              const Type &type, unsigned align,
-             const std::set<smt::expr> &undef_vars);
+             const std::set<smt::expr> &undef_vars, bool alias_write);
 
   smt::expr blockValRefined(const Memory &other, unsigned bid, bool local,
                             const smt::expr &offset,

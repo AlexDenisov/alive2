@@ -807,7 +807,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       }
 
       assert(!v.value.isValid() || v.value.bits() == bytes_per_load*8);
-      assert(!v.non_poison.isValid() ||
+      assert(!v.non_poison.isValid() || v.non_poison.isBool() ||
              v.non_poison.bits() == bytes_per_load*8);
 
       if (v1) {

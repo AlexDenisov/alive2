@@ -192,7 +192,7 @@ class Memory {
                 unsigned bytes, unsigned align, bool write) const;
 
   AliasSet computeAliasing(const Pointer &ptr, unsigned btyes, unsigned align,
-                           bool write);
+                           bool write) const;
 
   StateValue load(const Pointer &ptr, unsigned bytes,
                   std::set<smt::expr> &undef, unsigned align,

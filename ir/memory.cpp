@@ -11,11 +11,6 @@
 #include <numeric>
 #include <string>
 
-
-// FIXME: remove; for DEBUG
-#include <iostream>
-
-
 using namespace IR;
 using namespace smt;
 using namespace std;
@@ -31,6 +26,8 @@ using namespace util;
 static unsigned next_local_bid;
 static unsigned next_global_bid;
 static unsigned next_fn_memblock;
+
+static unsigned FULL_ALIGN = 1u << 31;
 
 static bool byte_has_ptr_bit() {
   return does_int_mem_access && does_ptr_mem_access;
@@ -450,8 +447,7 @@ Memory::MemStore::MemStore(const Pointer &src, const expr *size,
   uint64_t st_size = 1;
   if (size)
     size->isUInt(st_size);
-  src_alias = const_cast<Memory&>(src.getMemory())
-                 .computeAliasing(src, st_size, align_src, false);
+  src_alias = src.getMemory().computeAliasing(src, st_size, align_src, false);
 }
 
 const Memory::MemStore*
@@ -540,7 +536,7 @@ void Memory::MemStore::print(std::ostream &os) const {
 }
 
 
-static set<Pointer> all_leaf_ptrs(Memory &m, const expr &ptr) {
+static set<Pointer> all_leaf_ptrs(const Memory &m, const expr &ptr) {
   set<Pointer> ptrs;
   for (auto &ptr_val : ptr.leafs()) {
     Pointer p(m, ptr_val);
@@ -619,7 +615,7 @@ bool Memory::mayalias(bool local, unsigned bid0, const expr &offset0,
 }
 
 Memory::AliasSet Memory::computeAliasing(const Pointer &ptr, unsigned bytes,
-                                         unsigned align, bool write) {
+                                         unsigned align, bool write) const {
   assert(bytes % (bits_byte/8) == 0);
 
   AliasSet aliasing(*this);
@@ -1089,7 +1085,7 @@ Memory::Memory(State &state) : state(&state), escaped_local_blks(*this) {
     MemStore st(*this, "init_mem");
     st.alias.setMayAliasUpTo(false, num_nonlocals_src - 1,
                              has_null_block + num_consts_src);
-    store(nullopt, nullptr, 1u << 31, move(st));
+    store(nullopt, nullptr, FULL_ALIGN, move(st));
 
     non_local_block_liveness = mk_liveness_array();
 
@@ -1371,7 +1367,7 @@ void Memory::setState(const CallState &st) {
     for (auto &[ptr, alias] : data) {
       MemStore mem(*this, uf.c_str());
       mem.alias = alias;
-      store(ptr, nullptr, 1u << 31, move(mem));
+      store(ptr, nullptr, FULL_ALIGN, move(mem));
     }
     if (!first)
       store_seq_head = MemStore::mkIf(cond, store_seq_head, prev_head);
@@ -1787,7 +1783,7 @@ Memory::refined(const Memory &other, bool fncall,
   Pointer ptr(*this, "#idx_refinement", false);
   expr ptr_bid = ptr.getBid();
   expr offset = ptr.getOffset();
-  expr ret(true);
+  AndExpr ret;
   set<expr> undef_vars;
 
   auto relevant = [&](const Memory &m, const MemStore *st) {
@@ -1847,33 +1843,68 @@ Memory::refined(const Memory &other, bool fncall,
       auto src_I = src_stores.find(bid);
       auto &src_list = src_I == src_stores.end() ? empty_vector : src_I->second;
 
-      for (auto &[tgt_path, tgt_offset, tgt_size] : tgt_list) {
-        OrExpr src_domain;
+      for (auto &tgt_data : tgt_list) {
+        auto &[tgt_path, tgt_offset, tgt_size] = tgt_data;
         // fast path: stores match and tgt domain -> src domain
+        bool found = false;
         for (auto &[src_path, src_offset, src_size] : src_list) {
-          if (tgt_offset.eq(src_offset) && tgt_size.ule(src_size).isTrue())
-            src_domain.add(src_path);
+          if (src_path.eq(tgt_path) &&
+              tgt_offset.eq(src_offset) &&
+              tgt_size.ule(src_size).isTrue()) {
+            found = true;
+            break;
+          }
         }
-
-        if (src_domain.contains(tgt_path))
+        if (found)
           continue;
 
-        // slow path
-        // TODO
-        cout << "[MEMREF] SLOW PATH: " << bid << " / tgt_path=" << tgt_path
-             << "\nsrc_domain=" << src_domain << "\noffset=" << tgt_offset
-             << " size=" << tgt_size << endl;
+        // 2 slow paths:
+        // - Bid is const: only check stores to this bid
+        // - Bid is not const: need to check all stores as Bid may alias with
+        //   anything
+
+        auto check = [&](auto &src_list) {
+          auto &[tgt_path, tgt_offset, tgt_size] = tgt_data;
+          OrExpr c;
+          for (auto &[src_path, src_offset, src_size] : src_list) {
+            c.add(src_path &&
+                  offset.uge(src_offset) &&
+                  offset.ult(src_offset + src_size));
+          }
+          return (tgt_path &&
+                  offset.uge(tgt_offset) &&
+                  offset.ult(tgt_offset + tgt_size)
+                 ).implies(c());
+        };
+
+        expr cond;
+        if (bid.isConst()) {
+          cond = check(src_list);
+        } else {
+          cond = false;
+          for (auto &[src_bid, src_list]: src_stores) {
+            cond |= bid == src_bid && check(src_list);
+          }
+        }
+        ret.add((ptr_bid == bid).implies(cond));
       }
     }
   }
 
   if (!store_seq_head)
-    return { move(ret), move(ptr), move(undef_vars) };
+    return { ret(), move(ptr), move(undef_vars) };
 
   // check that written locs in src are refined by tgt
   AliasSet full_alias(*this);
-  if (fncall) {
-
+  if (fncall && set_ptrs) {
+    auto alias = [&](auto &m, auto *ptrs) {
+      for (auto &p : *ptrs) {
+        full_alias.unionWith(
+          computeAliasing(Pointer(m, p.val.value), 1, FULL_ALIGN, false));
+      }
+    };
+    alias(*this, set_ptrs);
+    alias(other, set_ptrs_other);
   } else {
     full_alias.setFullAlias(false);
   }
@@ -1941,7 +1972,7 @@ Memory::refined(const Memory &other, bool fncall,
   }
 #endif
 
-  return { move(ret), move(ptr), move(undef_vars) };
+  return { ret(), move(ptr), move(undef_vars) };
 }
 
 expr Memory::checkNocapture() const {

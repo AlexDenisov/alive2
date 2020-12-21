@@ -452,7 +452,8 @@ expr Pointer::fninputRefined(const Pointer &other, set<expr> &undef,
 
   expr local
     = expr::mkIf(isHeapAllocated(),
-                 other.isHeapAllocated() && off == off2 && size2.uge(size),
+                 getAllocType() == other.getAllocType() &&
+                 off == off2 && size == size2,
 
                  // must maintain same dereferenceability before & after
                  expr::mkIf(off.sle(-1),

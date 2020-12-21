@@ -151,8 +151,6 @@ class Memory {
     static const MemStore* mkIf(const smt::expr &cond, const MemStore *then,
                                 const MemStore *els);
 
-    bool isInitBlock() const;
-
     void print(std::ostream &os) const;
 
     auto operator<=>(const MemStore &rhs) const = default;
@@ -222,7 +220,21 @@ public:
   };
 
   class CallState {
-    const MemStore *store_seq_head;
+    struct Data {
+      std::optional<Pointer> ptr;
+      AliasSet alias;
+
+      Data& operator=(const Data &rhs) {
+        ptr.reset();
+        if (rhs.ptr)
+          ptr.emplace(*rhs.ptr);
+        alias = rhs.alias;
+        return *this;
+      }
+
+      auto operator<=>(const Data &rhs) const = default;
+    };
+    std::vector<std::tuple<smt::expr, std::string, std::vector<Data>>> ufs;
     smt::expr non_local_liveness;
     bool empty = true;
 

@@ -100,6 +100,10 @@ static void store_bv(Pointer &p, const expr &val, expr &local,
   non_local = expr::mkIf(!is_local, set(non_local), non_local);
 }
 
+static bool is_init_block(const string &str) {
+  return str == "init_mem";
+}
+
 namespace IR {
 
 Byte::Byte(const Memory &m, expr &&byterepr) : m(m), p(move(byterepr)) {
@@ -267,14 +271,9 @@ ostream& operator<<(ostream &os, const Byte &byte) {
 }
 
 bool Memory::isInitialMemBlock(const expr &e) {
-  string name;
   expr blk;
   unsigned hi, lo;
-  if (e.isExtract(blk, hi, lo))
-    name = blk.fn_name();
-  else
-    name = e.fn_name();
-  return name == "init_mem";
+  return is_init_block(e.isExtract(blk, hi, lo) ? blk.fn_name() : e.fn_name());
 }
 
 Memory::AliasSet::AliasSet(const Memory &m)
@@ -469,10 +468,6 @@ Memory::MemStore::mkIf(const expr &cond, const MemStore *then,
   st.alias.setFullAlias(false);
   st.alias.setFullAlias(true);
   return &*mem_store_holder.emplace(move(st)).first;
-}
-
-bool Memory::MemStore::isInitBlock() const {
-  return uf_name == "init_mem";
 }
 
 void Memory::MemStore::print(std::ostream &os) const {
@@ -933,7 +928,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           StateValue widesv;
           for (unsigned j = 0; j < bytes_per_load; j += bits_byte/8) {
-            auto ptr_uf = (ptr + i).shortPtr(st.isInitBlock());
+            auto ptr_uf = (ptr + i).shortPtr(is_init_block(st.uf_name));
             Byte byte(*this, expr::mkUF(st.uf_name, { ptr_uf }, range));
             StateValue sv;
             if (type == DATA_INT) {
@@ -1273,14 +1268,13 @@ Memory::CallState Memory::CallState::mkIf(const expr &cond,
                                           const CallState &then,
                                           const CallState &els) {
   CallState ret;
-#if 0
-FIXME
-  for (unsigned i = 0, e = then.non_local_block_val.size(); i != e; ++i) {
-    ret.non_local_block_val.emplace_back(
-      expr::mkIf(cond, then.non_local_block_val[i],
-                 els.non_local_block_val[i]));
+  for (auto &[c, uf, data] : then.ufs) {
+    ret.ufs.emplace_back(c.isTrue() ? cond : c, uf, data);
   }
-#endif
+  for (auto &[c, uf, data] : els.ufs) {
+    ret.ufs.emplace_back(c.isTrue() ? !cond : c, uf, data);
+  }
+
   ret.non_local_liveness = expr::mkIf(cond, then.non_local_liveness,
                                       els.non_local_liveness);
   return ret;
@@ -1293,11 +1287,18 @@ expr Memory::CallState::operator==(const CallState &rhs) const {
     return true;
 
   expr ret(true);
-#if 0
-  for (unsigned i = 0, e = non_local_block_val.size(); i != e; ++i) {
-    ret &= non_local_block_val[i] == rhs.non_local_block_val[i];
+  assert(ufs.size() == 1 && rhs.ufs.size() == 1);
+  // If one is initial memory and the other is not, they can't be equal.
+  if (is_init_block(get<1>(ufs[0])) == is_init_block(get<1>(rhs.ufs[0]))) {
+    auto range = expr::mkUInt(0, Byte::bitsByte());
+    auto ptr
+      = expr::mkUInt(0, Pointer::totalBitsShort(is_init_block(get<1>(ufs[0]))));
+    ret &= expr::mkForAll({ptr},
+                          expr::mkUF(get<1>(ufs[0]), { ptr }, range) ==
+                            expr::mkUF(get<1>(rhs.ufs[0]), { ptr }, range));
+  } else {
+    return false;
   }
-#endif
   if (non_local_liveness.isValid() && rhs.non_local_liveness.isValid())
     ret &= non_local_liveness == rhs.non_local_liveness;
   return ret;
@@ -1310,30 +1311,25 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
   st.empty = false;
 
   {
-    auto uf_name = fnname + "#mem#" + to_string(next_fn_memblock++);
-    AliasSet full_alias(*this);
-
+    auto &data
+      = st.ufs.emplace_back(true,
+                            fnname + "#mem#" + to_string(next_fn_memblock++),
+                            vector<CallState::Data>());
     if (ptr_inputs) {
       for (auto &ptr_in : *ptr_inputs) {
         if (!ptr_in.val.non_poison.isFalse()) {
           Pointer ptr(*this, ptr_in.val.value);
-          MemStore mem(*this, uf_name.c_str());
-          mem.alias = computeAliasing(ptr, 1, 1, true);
-          full_alias.unionWith(mem.alias);
-          store(ptr, nullptr, 1u << 31, move(mem));
+          get<2>(data).emplace_back(ptr, computeAliasing(ptr, 1, 1, true));
         }
       }
     } else {
-      MemStore mem(*this, uf_name.c_str());
-      mem.alias = escaped_local_blks;
-      mem.alias.setMayAliasUpTo(false, numNonlocals() - 1,
-                                has_null_block + num_consts_src);
-      full_alias = mem.alias;
-      store(nullopt, nullptr, 1u << 31, move(mem));
+      auto alias = escaped_local_blks;
+      alias.setMayAliasUpTo(false, numNonlocals() - 1,
+                            has_null_block + num_consts_src);
+      get<2>(data).emplace_back(nullopt, move(alias));
     }
-    mk_init_mem_val_axioms(uf_name.c_str(), true, false);
+    mk_init_mem_val_axioms(get<1>(data).c_str(), true, false);
   }
-  st.store_seq_head = store_seq_head;
 
   if (num_nonlocals_src && !nofree) {
     expr one  = expr::mkUInt(1, num_nonlocals);
@@ -1367,7 +1363,21 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
 }
 
 void Memory::setState(const CallState &st) {
-  store_seq_head = st.store_seq_head;
+  auto *head = store_seq_head;
+  bool first = true;
+  for (auto &[cond, uf, data] : st.ufs) {
+    auto *prev_head = store_seq_head;
+    store_seq_head = head;
+    for (auto &[ptr, alias] : data) {
+      MemStore mem(*this, uf.c_str());
+      mem.alias = alias;
+      store(ptr, nullptr, 1u << 31, move(mem));
+    }
+    if (!first)
+      store_seq_head = MemStore::mkIf(cond, store_seq_head, prev_head);
+    first = false;
+  }
+
   if (st.non_local_liveness.isValid())
     non_local_block_liveness = non_local_block_liveness & st.non_local_liveness;
 }
@@ -1766,7 +1776,8 @@ Memory::refined(const Memory &other, bool fncall,
                 const vector<PtrInput> *set_ptrs,
                 const vector<PtrInput> *set_ptrs_other) const {
   // TODO: needs to consider local escaped blocks
-  if (num_nonlocals <= has_null_block)
+  if (num_nonlocals <= has_null_block ||
+      store_seq_head == other.store_seq_head)
     return { true, Pointer(*this, expr()), {} };
 
   assert(!memory_unused());
@@ -2027,12 +2038,10 @@ Memory Memory::mkIf(const expr &cond, const Memory &then, const Memory &els) {
   assert(then.byval_blks == els.byval_blks);
   ret.escaped_local_blks.unionWith(els.escaped_local_blks);
 
-  ret.ptr_alias.clear();
-  for (const auto &[expr, alias] : then.ptr_alias) {
-    auto I = els.ptr_alias.find(expr);
-    if (I != els.ptr_alias.end())
-      ret.ptr_alias.emplace(expr, alias)
-         .first->second.unionWith(I->second);
+  for (const auto &[expr, alias] : els.ptr_alias) {
+    auto [I, inserted] = ret.ptr_alias.try_emplace(expr, alias);
+    if (!inserted)
+      I->second.unionWith(alias);
   }
   return ret;
 }

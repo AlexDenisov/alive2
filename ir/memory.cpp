@@ -1865,15 +1865,16 @@ Memory::refined(const Memory &other, bool fncall,
 
         auto check = [&](auto &src_list) {
           auto &[tgt_path, tgt_offset, tgt_size] = tgt_data;
+          auto loffset = offset.sextOrTrunc(bits_size_t);
           OrExpr c;
           for (auto &[src_path, src_offset, src_size] : src_list) {
             c.add(src_path &&
                   offset.uge(src_offset) &&
-                  offset.ult(src_offset + src_size));
+                  loffset.ult(src_offset.zextOrTrunc(bits_size_t) + src_size));
           }
           return (tgt_path &&
                   offset.uge(tgt_offset) &&
-                  offset.ult(tgt_offset + tgt_size)
+                  loffset.ult(tgt_offset.zextOrTrunc(bits_size_t) + tgt_size)
                  ).implies(c());
         };
 

@@ -65,6 +65,8 @@ public:
 
   const smt::expr& operator()() const { return p; }
 
+  smt::expr refined(const Byte &other) const;
+
   smt::expr operator==(const Byte &rhs) const {
     return p == rhs.p;
   }
@@ -75,8 +77,9 @@ public:
 
   static unsigned bitsByte();
 
-  static Byte mkPtrByte(const Memory &m, const smt::expr &val);
-  static Byte mkNonPtrByte(const Memory &m, const smt::expr &val);
+  static Byte mkPtrByte(const Memory &m, const StateValue &val,
+                        unsigned byteoffset);
+  static Byte mkNonPtrByte(const Memory &m, const StateValue &val);
   static Byte mkPoisonByte(const Memory &m);
   friend std::ostream& operator<<(std::ostream &os, const Byte &byte);
 };
@@ -196,9 +199,9 @@ class Memory {
 
   StateValue load(const Pointer &ptr, unsigned bytes,
                   std::set<smt::expr> &undef, unsigned align,
-                  DataType type = DATA_ANY);
+                  DataType type = DATA_ANY) const;
   StateValue load(const Pointer &ptr, const Type &type,
-                  std::set<smt::expr> &undef, unsigned align);
+                  std::set<smt::expr> &undef, unsigned align) const;
 
   void store(std::optional<Pointer> ptr, const smt::expr *bytes, unsigned align,
              MemStore &&data, bool alias_write = true);
@@ -207,12 +210,6 @@ class Memory {
   void store(const Pointer &ptr, unsigned offset, StateValue &&v,
              const Type &type, unsigned align,
              const std::set<smt::expr> &undef_vars, bool alias_write);
-
-  smt::expr blockValRefined(const Memory &other, unsigned bid, bool local,
-                            const smt::expr &offset,
-                            std::set<smt::expr> &undef) const;
-  smt::expr blockRefined(const Pointer &src, const Pointer &tgt, unsigned bid,
-                         std::set<smt::expr> &undef) const;
 
 public:
   enum BlockKind {
@@ -296,10 +293,10 @@ public:
   void store(const smt::expr &ptr, const StateValue &val, const Type &type,
              unsigned align, const std::set<smt::expr> &undef_vars);
   std::pair<StateValue, smt::AndExpr>
-    load(const smt::expr &ptr, const Type &type, unsigned align);
+    load(const smt::expr &ptr, const Type &type, unsigned align) const;
 
-  // raw load
-  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars, unsigned align);
+  // raw load; NB: no UB check
+  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars) const;
 
   void memset(const smt::expr &ptr, const StateValue &val,
               const smt::expr &bytesize, unsigned align,

@@ -210,6 +210,56 @@ expr Byte::isZero() const {
   return expr::mkIf(isPtr(), ptr().isNull(), nonptrValue() == 0);
 }
 
+expr Byte::refined(const Byte &other) const {
+  if (eq(other))
+    return true;
+
+  // refinement if offset had non-ptr value
+  expr v1 = nonptrValue();
+  expr v2 = other.nonptrValue();
+  expr np1 = nonptrNonpoison();
+  expr np2 = other.nonptrNonpoison();
+
+  expr int_cnstr;
+  if (bits_poison_per_byte == bits_byte) {
+    int_cnstr = (np2 | np1) == np1 && (v1 | np1) == (v2 | np1);
+  }
+  else if (bits_poison_per_byte > 1) {
+    assert((bits_byte % bits_poison_per_byte) == 0);
+    unsigned bits_val = bits_byte / bits_poison_per_byte;
+    int_cnstr = true;
+    for (unsigned i = 0; i < bits_poison_per_byte; ++i) {
+      expr ev1 = v1.extract((i+1) * bits_val - 1, i * bits_val);
+      expr ev2 = v2.extract((i+1) * bits_val - 1, i * bits_val);
+      expr enp1 = np1.extract(i, i);
+      expr enp2 = np2.extract(i, i);
+      int_cnstr
+        &= enp1 == 1 || ((enp1.eq(enp2) ? true : enp2 == 0) && ev1 == ev2);
+    }
+  } else {
+    int_cnstr = np1 == 1 || ((np1.eq(np2) ? true : np2 == 0) && v1 == v2);
+  }
+
+  // fast path: if we didn't do any ptr store, then all ptrs in memory were
+  // already there and don't need checking
+  expr is_ptr = isPtr();
+  expr is_ptr2 = other.isPtr();
+  expr ptr_cnstr;
+  if (!does_ptr_store || is_ptr.isFalse() || is_ptr2.isFalse()) {
+    ptr_cnstr = *this == other;
+  } else {
+    ptr_cnstr = !ptrNonpoison() ||
+                  (other.ptrNonpoison() &&
+                   ptrByteoffset() == other.ptrByteoffset() &&
+                   ptr().refined(other.ptr()));
+  }
+  return expr::mkIf(is_ptr == is_ptr2,
+                    expr::mkIf(is_ptr, ptr_cnstr, int_cnstr),
+                    // allow null ptr <-> zero
+                    isPoison() ||
+                      (isZero() && !other.isPoison() && other.isZero()));
+}
+
 unsigned Byte::bitsByte() {
   unsigned ptr_bits = does_ptr_mem_access *
                         (1 + Pointer::totalBits() + bits_ptr_byte_offset());
@@ -218,22 +268,32 @@ unsigned Byte::bitsByte() {
   return max(1u, byte_has_ptr_bit() + max(ptr_bits, int_bits));
 }
 
-Byte Byte::mkPtrByte(const Memory &m, const expr &val) {
+Byte Byte::mkPtrByte(const Memory &m, const StateValue &val,
+                     unsigned byteoffset) {
   assert(does_ptr_mem_access);
   expr byte;
   if (byte_has_ptr_bit())
     byte = expr::mkUInt(1, 1);
-  return { m, concat_if(byte, expr(val))
-                .concat_zeros(bits_for_ptrattrs + padding_ptr_byte()) };
+
+  expr ptr = val.non_poison.toBVBool().concat(val.value);
+  assert(bits_ptr_byte_offset() > 0 || byteoffset == 0);
+  if (bits_ptr_byte_offset() > 0)
+    ptr = ptr.concat(expr::mkUInt(byteoffset, bits_ptr_byte_offset()));
+  return { m, concat_if(byte, move(ptr)).concat_zeros(padding_ptr_byte()) };
 }
 
-Byte Byte::mkNonPtrByte(const Memory &m, const expr &val) {
+Byte Byte::mkNonPtrByte(const Memory &m, const StateValue &val) {
   if (!does_int_mem_access)
     return { m, expr::mkUInt(0, bitsByte()) };
   expr byte;
   if (byte_has_ptr_bit())
     byte = expr::mkUInt(0, 1);
-  return { m, concat_if(byte, expr(val)).concat_zeros(padding_nonptr_byte()) };
+  expr np = val.non_poison.isBool()
+              ? val.non_poison
+              : expr::mkIf(val.non_poison, expr::mkUInt(0, bits_byte),
+                           expr::mkInt(-1, bits_byte));
+  return { m, concat_if(byte, np.concat(val.value))
+                                .concat_zeros(padding_nonptr_byte()) };
 }
 
 Byte Byte::mkPoisonByte(const Memory &m) {
@@ -682,7 +742,7 @@ end:
 }
 
 StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
-                        unsigned align, DataType type) {
+                        unsigned align, DataType type) const {
   if (bytes == 0)
     return {};
 
@@ -717,6 +777,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
   unsigned num_loads = bytes / bytes_per_load;
   assert((bytes % bytes_per_load) == 0);
   assert((bytes_per_load % (bits_byte / 8)) == 0);
+  assert(type != DATA_ANY || num_loads == 1);
 
   map<tuple<const MemStore*, const Pointer*, const AliasSet*>,
       vector<StateValue>> vals;
@@ -874,6 +935,10 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           if (type == DATA_PTR) {
             store_ptr({ Pointer::mkNullPointer(*this).release(),
                         combine_np(value.non_poison, value.value == 0) });
+          } else if (type == DATA_ANY) {
+            StateValue sv;
+            sv.value = Byte::mkNonPtrByte(*this, value)();
+            store(i, sv, bits);
           } else {
             store(i, value, bits);
           }
@@ -887,6 +952,11 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           for (unsigned i = 0; i < bytes; i += bytes_per_load) {
             store(i, poison_byte, bits_program_pointer);
           }
+        } else if (type == DATA_ANY) {
+          // FIXME: fix byte offset to non-0
+          StateValue val;
+          val.value = Byte::mkPtrByte(*this, st.value, 0)();
+          store(0, val, bits_byte);
         } else {
           store_ptr(st.value);
         }
@@ -904,6 +974,11 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         for (unsigned i = 1; i < bytes_per_load; ++i) {
           elem = elem.concat(st.value);
         }
+        if (type == DATA_ANY) {
+          elem.value = Byte::mkNonPtrByte(*this, elem)();
+          elem.non_poison = expr();
+        }
+
         for (unsigned i = 0; i < bytes; i += bytes_per_load) {
           store(i, elem, 0);
         }
@@ -927,7 +1002,9 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             auto ptr_uf = (ptr + i).shortPtr(is_init_block(st.uf_name));
             Byte byte(*this, expr::mkUF(st.uf_name, { ptr_uf }, range));
             StateValue sv;
-            if (type == DATA_INT) {
+            if (type == DATA_ANY) {
+              sv.value = byte();
+            } else if (type == DATA_INT) {
               sv.value      = byte.nonptrValue();
               sv.non_poison = combine_np(byte.nonptrNonpoison(), !byte.isPtr());
             } else {
@@ -1573,7 +1650,7 @@ void Memory::store(const expr &p, const StateValue &v, const Type &type,
 }
 
 StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,
-                        unsigned align) {
+                        unsigned align) const {
   unsigned bytecount = getStoreByteSize(type);
 
   auto aty = type.getAsAggregateType();
@@ -1603,7 +1680,7 @@ StateValue Memory::load(const Pointer &ptr, const Type &type, set<expr> &undef,
 }
 
 pair<StateValue, AndExpr>
-Memory::load(const expr &p, const Type &type, unsigned align) {
+Memory::load(const expr &p, const Type &type, unsigned align) const {
   assert(!memory_unused());
 
   Pointer ptr(*this, p);
@@ -1613,10 +1690,9 @@ Memory::load(const expr &p, const Type &type, unsigned align) {
   return { state->rewriteUndef(move(ret), undef_vars), move(ubs) };
 }
 
-Byte Memory::load(const Pointer &p, set<expr> &undef, unsigned align) {
-  //return move(load(p, bits_byte / 8, undef, align)[0]);
-  // TODO
-  return { *this, expr() };
+Byte Memory::load(const Pointer &p, set<expr> &undef) const {
+  unsigned sz = bits_byte / 8;
+  return { *this, load(p, sz, undef, sz, DATA_ANY).value };
 }
 
 void Memory::memset(const expr &p, const StateValue &val, const expr &bytesize,
@@ -1665,115 +1741,14 @@ expr Memory::int2ptr(const expr &val) const {
   return {};
 }
 
-expr Memory::blockValRefined(const Memory &other, unsigned bid, bool local,
-                             const expr &offset, set<expr> &undef) const {
-  assert(!local);
-  // TODO
-  //auto &mem1 = non_local_block_val[bid];
-  //auto &mem2 = other.non_local_block_val[bid].val;
-
-  //Byte val(*this, mem1.val.load(offset));
-  //Byte val2(other, mem2.load(offset));
-  Byte val(*this, expr()), val2(*this, expr());
-
-  if (val.eq(val2))
-    return true;
-
-  //undef.insert(mem1.undef.begin(), mem1.undef.end());
-
-  // refinement if offset had non-ptr value
-  expr v1 = val.nonptrValue();
-  expr v2 = val2.nonptrValue();
-  expr np1 = val.nonptrNonpoison();
-  expr np2 = val2.nonptrNonpoison();
-
-  expr int_cnstr;
-  if (bits_poison_per_byte == bits_byte) {
-    int_cnstr = (np2 | np1) == np1 && (v1 | np1) == (v2 | np1);
-  }
-  else if (bits_poison_per_byte > 1) {
-    assert((bits_byte % bits_poison_per_byte) == 0);
-    unsigned bits_val = bits_byte / bits_poison_per_byte;
-    int_cnstr = true;
-    for (unsigned i = 0; i < bits_poison_per_byte; ++i) {
-      expr ev1 = v1.extract((i+1) * bits_val - 1, i * bits_val);
-      expr ev2 = v2.extract((i+1) * bits_val - 1, i * bits_val);
-      expr enp1 = np1.extract(i, i);
-      expr enp2 = np2.extract(i, i);
-      int_cnstr
-        &= enp1 == 1 || ((enp1.eq(enp2) ? true : enp2 == 0) && ev1 == ev2);
-    }
-  } else {
-    int_cnstr = np1 == 1 || ((np1.eq(np2) ? true : np2 == 0) && v1 == v2);
-  }
-
-  // fast path: if we didn't do any ptr store, then all ptrs in memory were
-  // already there and don't need checking
-  expr is_ptr = val.isPtr();
-  expr is_ptr2 = val2.isPtr();
-  expr ptr_cnstr;
-  if (!does_ptr_store || is_ptr.isFalse() || is_ptr2.isFalse()) {
-    ptr_cnstr = val == val2;
-  } else {
-    ptr_cnstr = !val.ptrNonpoison() ||
-                  (val2.ptrNonpoison() &&
-                   val.ptrByteoffset() == val2.ptrByteoffset() &&
-                   val.ptr().refined(val2.ptr()));
-  }
-  return expr::mkIf(is_ptr == is_ptr2,
-                    expr::mkIf(is_ptr, ptr_cnstr, int_cnstr),
-                    // allow null ptr <-> zero
-                    val.isPoison() ||
-                      (val.isZero() && !val2.isPoison() && val2.isZero()));
-}
-
-expr Memory::blockRefined(const Pointer &src, const Pointer &tgt, unsigned bid,
-                          set<expr> &undef) const {
-  unsigned bytes_per_byte = bits_byte / 8;
-
-  expr blk_size = src.blockSize();
-  expr ptr_offset = src.getShortOffset();
-  expr val_refines;
-
-  uint64_t bytes;
-  if (blk_size.isUInt(bytes) && (bytes / bytes_per_byte) <= 8) {
-    val_refines = true;
-    for (unsigned off = 0; off < (bytes / bytes_per_byte); ++off) {
-      expr off_expr = expr::mkUInt(off, Pointer::bitsShortOffset());
-      val_refines
-        &= (ptr_offset == off_expr).implies(
-             blockValRefined(tgt.getMemory(), bid, false, off_expr, undef));
-    }
-  } else {
-    val_refines
-      = src.getOffsetSizet().ult(blk_size).implies(
-          blockValRefined(tgt.getMemory(), bid, false, ptr_offset, undef));
-  }
-
-  assert(src.isWritable().eq(tgt.isWritable()));
-
-  expr aligned(true);
-  expr src_align = src.blockAlignment();
-  expr tgt_align = tgt.blockAlignment();
-  // if they are both non-const, then the condition holds per the precondition
-  if (src_align.isConst() || tgt_align.isConst())
-    aligned = src_align.ule(tgt_align);
-
-  expr alive = src.isBlockAlive();
-  return alive == tgt.isBlockAlive() &&
-         blk_size == tgt.blockSize() &&
-         src.getAllocType() == tgt.getAllocType() &&
-         aligned &&
-         alive.implies(val_refines);
-}
-
 tuple<expr, Pointer, set<expr>>
 Memory::refined(const Memory &other, bool fncall,
                 const vector<PtrInput> *set_ptrs,
                 const vector<PtrInput> *set_ptrs_other) const {
   // TODO: needs to consider local escaped blocks
-  if (num_nonlocals <= has_null_block ||
-      store_seq_head == other.store_seq_head)
+  if (!set_ptrs &&
+      (num_nonlocals <= has_null_block ||
+       store_seq_head == other.store_seq_head))
     return { true, Pointer(*this, expr()), {} };
 
   assert(!memory_unused());
@@ -1877,6 +1852,7 @@ Memory::refined(const Memory &other, bool fncall,
       for (auto &[path, offset, size] : stores) {
         c |= path &&
              ptr_offset.uge(offset) &&
+             // FIXME: needs to truncate size to alignment size or size in bytes??
              ptr_offset_sizet.ult(offset.zextOrTrunc(bits_size_t) + size);
       }
       return c;
@@ -1896,7 +1872,9 @@ Memory::refined(const Memory &other, bool fncall,
   if (!store_seq_head)
     return { ret(), move(ptr), move(undef_vars) };
 
-  // check that written locs in src are refined by tgt
+  // 2) check that written locs in src are refined by tgt
+#if 0
+  // TODO: optimization
   AliasSet full_alias(*this);
   if (fncall && set_ptrs) {
     auto alias = [&](auto &m, auto *ptrs) {
@@ -1950,29 +1928,51 @@ Memory::refined(const Memory &other, bool fncall,
     // TODO: traverse tgt stores
 
   } while (!todo.empty());
+#endif
 
-#if 0
-  unsigned bid = has_null_block + skip_constants * num_consts_src;
+  // simple linear encoding
+  ret.add(
+    ptr.isBlockAlive()
+       .implies(load(ptr, undef_vars).refined(other.load(ptr, undef_vars))));
+
+  // 3) check that block properties are refined
+  unsigned bid = has_null_block + fncall * num_consts_src;
   for (; bid < num_nonlocals_src; ++bid) {
     expr bid_expr = expr::mkUInt(bid, bits_for_bid);
-    Pointer p(*this, bid_expr, offset);
+    Pointer p(*this, bid_expr, ptr_offset);
     Pointer q(other, p());
     if (p.isByval().isTrue() && q.isByval().isTrue())
       continue;
-    ret &= (ptr_bid == bid_expr).implies(blockRefined(p, q, bid, undef_vars));
+
+    assert(p.isWritable().eq(q.isWritable()));
+    expr aligned(true);
+    expr p_align = p.blockAlignment();
+    expr q_align = q.blockAlignment();
+    // if they are both non-const, then the condition holds per the precondition
+    if (p_align.isConst() || q_align.isConst())
+      aligned = p_align.ule(q_align);
+
+    ret.add((ptr_bid == bid_expr).implies(
+              p.isBlockAlive() == q.isBlockAlive() &&
+              p.blockSize() == q.blockSize() &&
+              p.getAllocType() == q.getAllocType() &&
+              aligned
+            ));
   }
 
   // restrict refinement check to set of request blocks
   if (set_ptrs) {
-    expr c(false);
-    for (auto &itm: *set_ptrs) {
-      // TODO: deal with the byval arg case (itm.second)
-      auto &ptr = itm.val;
-      c |= ptr.non_poison && Pointer(*this, ptr.value).getBid() == ptr_bid;
+    OrExpr c;
+    for (auto *set : { set_ptrs, set_ptrs_other }) {
+      for (auto &ptr: *set) {
+        c.add(ptr.val.non_poison &&
+              Pointer(*this, ptr.val.value).getBid() == ptr_bid);
+      }
     }
-    ret = c.implies(ret);
+    expr r = c().implies(ret());
+    ret.reset();
+    ret.add(move(r));
   }
-#endif
 
   return { ret(), move(ptr), move(undef_vars) };
 }

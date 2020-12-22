@@ -1782,7 +1782,8 @@ Memory::refined(const Memory &other, bool fncall,
 
   Pointer ptr(*this, "#idx_refinement", false);
   expr ptr_bid = ptr.getBid();
-  expr offset = ptr.getOffset();
+  expr ptr_offset = ptr.getOffset();
+  expr ptr_offset_sizet = ptr_offset.zextOrTrunc(bits_size_t);
   AndExpr ret;
   set<expr> undef_vars;
 
@@ -1837,58 +1838,58 @@ Memory::refined(const Memory &other, bool fncall,
     // bid -> (path, offset, size)*
     auto src_stores = collect_stores(*this);
     auto tgt_stores = collect_stores(other);
-    vector<tuple<expr, expr, expr>> empty_vector;
 
-    for (auto &[bid, tgt_list] : tgt_stores) {
+    // optimization: remove tgt stores that are trivially matched by src stores
+    for (auto I = tgt_stores.begin(); I != tgt_stores.end(); ) {
+      auto &[bid, tgt_list] = *I;
       auto src_I = src_stores.find(bid);
-      auto &src_list = src_I == src_stores.end() ? empty_vector : src_I->second;
+      if (src_I == src_stores.end()) {
+        ++I;
+        continue;
+      }
+      auto &src_list = src_I->second;
 
-      for (auto &tgt_data : tgt_list) {
-        auto &[tgt_path, tgt_offset, tgt_size] = tgt_data;
-        // fast path: stores match and tgt domain -> src domain
+      for (auto I = tgt_list.begin(); I != tgt_list.end(); ) {
+        auto &[tgt_path, tgt_offset, tgt_size] = *I;
         bool found = false;
         for (auto &[src_path, src_offset, src_size] : src_list) {
           if (src_path.eq(tgt_path) &&
               tgt_offset.eq(src_offset) &&
               tgt_size.ule(src_size).isTrue()) {
+            I = tgt_list.erase(I);
             found = true;
             break;
           }
         }
-        if (found)
-          continue;
-
-        // 2 slow paths:
-        // - Bid is const: only check stores to this bid
-        // - Bid is not const: need to check all stores as Bid may alias with
-        //   anything
-
-        auto check = [&](auto &src_list) {
-          auto &[tgt_path, tgt_offset, tgt_size] = tgt_data;
-          auto loffset = offset.sextOrTrunc(bits_size_t);
-          OrExpr c;
-          for (auto &[src_path, src_offset, src_size] : src_list) {
-            c.add(src_path &&
-                  offset.uge(src_offset) &&
-                  loffset.ult(src_offset.zextOrTrunc(bits_size_t) + src_size));
-          }
-          return (tgt_path &&
-                  offset.uge(tgt_offset) &&
-                  loffset.ult(tgt_offset.zextOrTrunc(bits_size_t) + tgt_size)
-                 ).implies(c());
-        };
-
-        expr cond;
-        if (bid.isConst()) {
-          cond = check(src_list);
-        } else {
-          cond = false;
-          for (auto &[src_bid, src_list]: src_stores) {
-            cond |= bid == src_bid && check(src_list);
-          }
-        }
-        ret.add((ptr_bid == bid).implies(cond));
+        if (!found)
+          ++I;
       }
+
+      if (tgt_list.empty())
+        I = tgt_stores.erase(I);
+      else
+        ++I;
+    }
+
+    // check remaining non-trivial tgt stores
+    auto check = [&](auto &stores) {
+      expr c(false);
+      for (auto &[path, offset, size] : stores) {
+        c |= path &&
+             ptr_offset.uge(offset) &&
+             ptr_offset_sizet.ult(offset.zextOrTrunc(bits_size_t) + size);
+      }
+      return c;
+    };
+    if (!tgt_stores.empty()) {
+      expr src(false), tgt(false);
+      for (auto &[bid, stores] : src_stores) {
+        src |= ptr_bid == bid && check(stores);
+      }
+      for (auto &[bid, stores] : tgt_stores) {
+        tgt |= ptr_bid == bid && check(stores);
+      }
+      ret.add(tgt.implies(src));
     }
   }
 

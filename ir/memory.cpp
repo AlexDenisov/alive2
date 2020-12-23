@@ -289,9 +289,9 @@ Byte Byte::mkNonPtrByte(const Memory &m, const StateValue &val) {
   if (byte_has_ptr_bit())
     byte = expr::mkUInt(0, 1);
   expr np = val.non_poison.isBool()
-              ? val.non_poison
-              : expr::mkIf(val.non_poison, expr::mkUInt(0, bits_byte),
-                           expr::mkInt(-1, bits_byte));
+              ? expr::mkIf(val.non_poison, expr::mkUInt(0, bits_byte),
+                           expr::mkInt(-1, bits_byte))
+              : val.non_poison;
   return { m, concat_if(byte, np.concat(val.value))
                                 .concat_zeros(padding_nonptr_byte()) };
 }
@@ -863,9 +863,11 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         added_undef_vars = true;
       }
 
-      assert(!v.value.isValid() || v.value.bits() == bytes_per_load*8);
+      assert(!v.value.isValid() ||
+             (type == DATA_ANY && v.value.bits() == Byte::bitsByte()) ||
+             (type != DATA_ANY && v.value.bits() == bytes_per_load*8));
       assert(!v.non_poison.isValid() || v.non_poison.isBool() ||
-             v.non_poison.bits() == bytes_per_load*8);
+             type == DATA_ANY || v.non_poison.bits() == bytes_per_load*8);
 
       if (v1) {
         auto &v1_sv = (*v1)[i / bytes_per_load];

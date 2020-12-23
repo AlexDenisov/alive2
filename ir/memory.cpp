@@ -1035,9 +1035,20 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             assert(st.next);
             widesv = StateValue::mkIf(ptr.getBid() == st.ptr->getBid(), widesv,
                                       (*v1)[i / bytes_per_load]);
-          } else { // initial memory value or fn call
+          }
+          else if (st.next) { // generic function call
+            expr cond = true;
+            if (num_consts_src != 0)
+              cond = ptr.getShortBid().uge(has_null_block + num_consts_src);
+
+            cond = expr::mkIf(ptr.isLocal(),
+                              st.alias.mayAlias(true, ptr.getShortBid()),
+                              cond);
+            widesv = StateValue::mkIf(cond, widesv, (*v1)[i / bytes_per_load]);
+          }
+          else { // initial memory value
+            assert(is_init_block(st.uf_name));
             assert(st.alias.numMayAlias(true) == 0);
-            assert(st.alias.numMayAlias(false) == num_nonlocals_src);
             widesv = StateValue::mkIf(ptr.isLocal(), poison_byte, widesv);
           }
           val.emplace_back(move(widesv));

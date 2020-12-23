@@ -821,7 +821,12 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       v1 = &I->second;
     }
 
-    StateValue poison_byte(expr::mkUInt(0, bytes_per_load * 8), false);
+    StateValue poison_byte;
+    if (type == DATA_ANY)
+      poison_byte.value = Byte::mkPoisonByte(*this)();
+    else
+      poison_byte = { expr::mkUInt(0, bytes_per_load * 8), false };
+
     bool added_undef_vars = false;
 
     if (!st.alias.intersects(alias)) {

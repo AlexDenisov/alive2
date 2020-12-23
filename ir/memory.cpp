@@ -1030,14 +1030,14 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           if (num_loads > 1 && type == DATA_PTR)
             widesv.value = widesv.value.concat(expr::mkUInt(i, 3));
 
-          // function call havoc
+          // function call w/ havoc of a single input ptr
           if (st.ptr) {
             assert(st.next);
             widesv = StateValue::mkIf(ptr.getBid() == st.ptr->getBid(), widesv,
                                       (*v1)[i / bytes_per_load]);
-          } else { // initial memory value
-            assert(!st.next);
+          } else { // initial memory value or fn call
             assert(st.alias.numMayAlias(true) == 0);
+            assert(st.alias.numMayAlias(false) == num_nonlocals_src);
             widesv = StateValue::mkIf(ptr.isLocal(), poison_byte, widesv);
           }
           val.emplace_back(move(widesv));

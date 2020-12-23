@@ -1377,8 +1377,8 @@ expr Memory::CallState::operator==(const CallState &rhs) const {
   // If one is initial memory and the other is not, they can't be equal.
   if (is_init_block(get<1>(ufs[0])) == is_init_block(get<1>(rhs.ufs[0]))) {
     auto range = expr::mkUInt(0, Byte::bitsByte());
-    auto ptr
-      = expr::mkUInt(0, Pointer::totalBitsShort(is_init_block(get<1>(ufs[0]))));
+    auto bits_ptr = Pointer::totalBitsShort(is_init_block(get<1>(ufs[0])));
+    auto ptr = expr::mkVar("#ptr", bits_ptr);
     ret &= expr::mkForAll({ptr},
                           expr::mkUF(get<1>(ufs[0]), { ptr }, range) ==
                             expr::mkUF(get<1>(rhs.ufs[0]), { ptr }, range));

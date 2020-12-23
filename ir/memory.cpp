@@ -1755,7 +1755,7 @@ Memory::refined(const Memory &other, bool fncall,
 
   assert(!memory_unused());
   assert(!set_ptrs || fncall);
-  assert(((set_ptrs != 0) ^ (set_ptrs_other != 0)) == 0);
+  assert((set_ptrs != nullptr) == (set_ptrs_other != nullptr));
 
   Pointer ptr(*this, "#idx_refinement", false);
   expr ptr_bid = ptr.getBid();
@@ -1783,7 +1783,7 @@ Memory::refined(const Memory &other, bool fncall,
 
   // 1) Check that set of tgt written locs is in set of src written locs
   // i.e., we can remove stores but can't introduce stores to new locations
-  if (other.store_seq_head) {
+  {
     auto collect_stores = [&](const Memory &m) {
       // bid -> (path, offset, size)*
       map<expr, vector<tuple<expr, expr, expr>>> stores;
@@ -1801,7 +1801,7 @@ Memory::refined(const Memory &other, bool fncall,
         if (st->type != MemStore::FN && relevant(m, st)) {
           assert(st->size);
           stores[st->ptr->getBid()]
-            .emplace_back(path, st->ptr->getShortOffset(), *st->size);
+            .emplace_back(path, st->ptr->getOffset(), *st->size);
         }
 
         if (st->next) {
@@ -1854,7 +1854,6 @@ Memory::refined(const Memory &other, bool fncall,
       for (auto &[path, offset, size] : stores) {
         c |= path &&
              ptr_offset.uge(offset) &&
-             // FIXME: needs to truncate size to alignment size or size in bytes??
              ptr_offset_sizet.ult(offset.zextOrTrunc(bits_size_t) + size);
       }
       return c;
@@ -1870,9 +1869,6 @@ Memory::refined(const Memory &other, bool fncall,
       ret.add(tgt.implies(src));
     }
   }
-
-  if (!store_seq_head)
-    return { ret(), move(ptr), move(undef_vars) };
 
   // 2) check that written locs in src are refined by tgt
 #if 0
@@ -1963,6 +1959,7 @@ Memory::refined(const Memory &other, bool fncall,
   }
 
   // restrict refinement check to set of request blocks
+  expr refine;
   if (set_ptrs) {
     OrExpr c;
     for (auto *set : { set_ptrs, set_ptrs_other }) {
@@ -1971,12 +1968,14 @@ Memory::refined(const Memory &other, bool fncall,
               Pointer(*this, ptr.val.value).getBid() == ptr_bid);
       }
     }
-    expr r = c().implies(ret());
-    ret.reset();
-    ret.add(move(r));
+    refine = c().implies(ret());
+  } else {
+    refine = (ptr_bid.uge(has_null_block + fncall * num_consts_src) &&
+              ptr_bid.ult(num_nonlocals_src))
+             .implies(ret());
   }
 
-  return { ret(), move(ptr), move(undef_vars) };
+  return { move(refine), move(ptr), move(undef_vars) };
 }
 
 expr Memory::checkNocapture() const {

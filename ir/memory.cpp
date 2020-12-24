@@ -824,22 +824,20 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       assert(st.ptr);
       expr cond;
       if (bytes*8 != total_size || st.align < bytes || align < bytes) {
-        assert(st.size);
         cond = ptr.getBid() == st.ptr->getBid();
-        expr load_offset = (ptr + i).getShortOffset();
-        expr store_offset = st.ptr->getShortOffset();
 
-        if (!ptr.getShortOffset().eq(store_offset))
+        // realloc uses COPY node with no st.size
+        if (st.size) {
+          expr load_offset = (ptr + i).getShortOffset();
+          expr store_offset = st.ptr->getShortOffset();
           cond &= load_offset.uge(store_offset);
 
-        // skip upperbound conditions if loading from the same ptr as store
-        // and there's space left to read
-        uint64_t store_size;
-        if (!(load_offset.eq(store_offset) && st.size->isUInt(store_size) &&
-              store_size >= bytes_per_load)) {
-          auto upper_bound
-            = (*st.ptr + *st.size + expr::mkInt(-i, bits_for_offset));
-          cond &= load_offset.ult(upper_bound.getShortOffset());
+          if (!load_offset.eq(store_offset)) {
+            auto upper_bound
+              = (*st.ptr + *st.size +
+                   expr::mkInt(-i * bytes_per_load, bits_for_offset));
+            cond &= load_offset.ult(upper_bound.getShortOffset());
+          }
         }
       } else {
         cond = (ptr + i) == *st.ptr;
@@ -854,14 +852,13 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       assert(!v.value.isValid() ||
              (type == DATA_ANY && v.value.bits() == Byte::bitsByte()) ||
              (type != DATA_ANY && v.value.bits() == bits_byte));
-      assert(type == DATA_ANY ||
-             !v.non_poison.isValid() || v.non_poison.isBool() ||
-             v.non_poison.bits() == bits_poison_per_byte);
+      assert(!v.non_poison.isValid() ||
+             (type == DATA_ANY || v.non_poison.isBool()) ||
+             (type != DATA_ANY || v.non_poison.bits() == bits_poison_per_byte));
 
-      if (v1) {
-        auto &v1_sv = (*v1)[i / bytes_per_load];
-        val.emplace_back(StateValue::mkIf(cond, v, v1_sv));
-      } else
+      if (v1)
+        val.emplace_back(StateValue::mkIf(cond, v, (*v1)[i / bytes_per_load]));
+      else
         val.emplace_back(cond.isFalse() ? poison_byte : v);
     };
 
@@ -877,8 +874,9 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       }
     };
 
-    auto combine_np = [](const expr &np, const expr &cond) {
-      return np | expr::mkIf(cond, expr::mkUInt(0, np), expr::mkInt(-1, np));
+    auto np_to_bool = [](StateValue &val) {
+      if (!val.non_poison.isBool())
+        val.non_poison = val.non_poison == 0;
     };
 
     switch (st.type) {
@@ -933,14 +931,14 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           assert(!st.value.isValid() || !(*st.ptr)().isValid() ||
                  value.bits() == bytes_per_load * 8);
 
+          np_to_bool(value);
+
           // allow zero -> null type punning
           if (type == DATA_PTR) {
             store_ptr({ Pointer::mkNullPointer(*this).release(),
-                        combine_np(value.non_poison, value.value == 0) });
+                        value.non_poison && value.value == 0 });
           } else if (type == DATA_ANY) {
-            StateValue sv;
-            sv.value = Byte(*this, value)();
-            store(i, sv, bits);
+            store(i, { Byte(*this, value)(), expr() }, bits);
           } else {
             store(i, value, bits);
           }
@@ -956,9 +954,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           }
         } else if (type == DATA_ANY) {
           // FIXME: fix byte offset to non-0
-          StateValue val;
-          val.value = Byte(*this, st.value, 0)();
-          store(0, val, bits_byte);
+          store(0, { Byte(*this, st.value, 0)(), expr() }, bits_byte);
         } else {
           store_ptr(st.value);
         }
@@ -968,11 +964,12 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         // allow zero -> null type punning
         if (type == DATA_PTR) {
           store_ptr({ Pointer::mkNullPointer(*this).release(),
-                      combine_np(st.value.non_poison, st.value.value == 0) });
+                      st.value.non_poison && st.value.value == 0 });
           break;
         }
 
         auto elem = st.value;
+        np_to_bool(elem);
         for (unsigned i = 1; i < bytes_per_load; ++i) {
           elem = elem.concat(st.value);
         }
@@ -1008,7 +1005,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
               sv.value = move(byte)();
             } else if (type == DATA_INT) {
               sv.value      = byte.nonptrValue();
-              sv.non_poison = combine_np(byte.nonptrNonpoison(), !byte.isPtr());
+              sv.non_poison = byte.nonptrNonpoison() == 0 && !byte.isPtr();
             } else {
               assert(type == DATA_PTR);
               sv.value      = expr::mkIf(byte.isPtr(),
@@ -1020,10 +1017,6 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
                                          // allow zero -> null type punning
                                          byte.nonptrNonpoison() == 0 &&
                                            byte.nonptrValue() == 0);
-
-              auto npbits = bytes_per_load * bits_poison_per_byte;
-              sv.non_poison = expr::mkIf(sv.non_poison, expr::mkUInt(0, npbits),
-                                         expr::mkInt(-1, npbits));
             }
             widesv = j == 0 ? move(sv) : widesv.concat(sv);
           }

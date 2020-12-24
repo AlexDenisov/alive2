@@ -845,9 +845,10 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 
       assert(!v.value.isValid() ||
              (type == DATA_ANY && v.value.bits() == Byte::bitsByte()) ||
-             (type != DATA_ANY && v.value.bits() == bytes_per_load*8));
-      assert(!v.non_poison.isValid() || v.non_poison.isBool() ||
-             type == DATA_ANY || v.non_poison.bits() == bytes_per_load*8);
+             (type != DATA_ANY && v.value.bits() == bits_byte));
+      assert(type == DATA_ANY ||
+             !v.non_poison.isValid() || v.non_poison.isBool() ||
+             v.non_poison.bits() == bits_poison_per_byte);
 
       if (v1) {
         auto &v1_sv = (*v1)[i / bytes_per_load];

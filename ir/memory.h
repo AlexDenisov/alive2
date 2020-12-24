@@ -47,11 +47,11 @@ public:
 
   // Creates a pointer byte that represents i'th byte of p.
   // non_poison should be an one-bit vector or boolean.
-  Byte(const Pointer &ptr, unsigned i, const smt::expr &non_poison);
+  Byte(const Memory &m, const StateValue &ptr, unsigned i);
 
-  // Creates a non-pointer byte that has data and non_poison.
-  // data and non_poison should have bits_byte bits.
-  Byte(const Memory &m, const smt::expr &data, const smt::expr &non_poison);
+  Byte(const Memory &m, const StateValue &non_poison);
+
+  static Byte mkPoisonByte(const Memory &m);
 
   smt::expr isPtr() const;
   smt::expr ptrNonpoison() const;
@@ -63,7 +63,7 @@ public:
   smt::expr isPoison(bool fullbit = true) const;
   smt::expr isZero() const; // zero or null
 
-  const smt::expr& operator()() const { return p; }
+  smt::expr&& operator()() && { return std::move(p); }
 
   smt::expr refined(const Byte &other) const;
 
@@ -77,10 +77,6 @@ public:
 
   static unsigned bitsByte();
 
-  static Byte mkPtrByte(const Memory &m, const StateValue &val,
-                        unsigned byteoffset);
-  static Byte mkNonPtrByte(const Memory &m, const StateValue &val);
-  static Byte mkPoisonByte(const Memory &m);
   friend std::ostream& operator<<(std::ostream &os, const Byte &byte);
 };
 

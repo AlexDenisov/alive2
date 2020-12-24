@@ -41,12 +41,6 @@ StateValue StateValue::concat(const StateValue &other) const {
                                : non_poison.concat(other.non_poison) };
 }
 
-StateValue StateValue::extract(unsigned high, unsigned low) const {
-  return { value.extract(high, low),
-           non_poison.isBool() ? expr(non_poison)
-                               : non_poison.extract(high, low) };
-}
-
 bool StateValue::isValid() const {
   return value.isValid() && non_poison.isValid();
 }

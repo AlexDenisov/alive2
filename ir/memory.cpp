@@ -107,8 +107,7 @@ Byte::Byte(const Memory &m, expr &&byterepr) : m(m), p(move(byterepr)) {
   assert(!p.isValid() || p.bits() == bitsByte());
 }
 
-Byte::Byte(const Pointer &ptr, unsigned i, const expr &non_poison)
-  : m(ptr.getMemory()) {
+Byte::Byte(const Memory &m, const StateValue &v, unsigned i) : m(m) {
   // TODO: support pointers larger than 64 bits.
   assert(bits_program_pointer <= 64 && bits_program_pointer % 8 == 0);
   assert(i == 0 || bits_ptr_byte_offset() > 0);
@@ -121,17 +120,19 @@ Byte::Byte(const Pointer &ptr, unsigned i, const expr &non_poison)
   if (byte_has_ptr_bit())
     p = expr::mkUInt(1, 1);
   p = concat_if(p,
-                expr::mkIf(non_poison, expr::mkUInt(0, 1), expr::mkUInt(1, 1)))
-      .concat(ptr());
+                expr::mkIf(v.non_poison, expr::mkUInt(0, 1),
+                           expr::mkUInt(1, 1)))
+      .concat(v.value);
   if (bits_ptr_byte_offset())
     p = p.concat(expr::mkUInt(i, bits_ptr_byte_offset()));
   p = p.concat_zeros(padding_ptr_byte());
-  assert(!p.isValid() || p.bits() == bitsByte());
+  assert(!v.isValid() || p.bits() == bitsByte());
 }
 
-Byte::Byte(const Memory &m, const expr &data, const expr &non_poison) : m(m) {
-  assert(!data.isValid() || data.bits() == bits_byte);
-  assert(!non_poison.isValid() || non_poison.bits() == bits_poison_per_byte);
+Byte::Byte(const Memory &m, const StateValue &v) : m(m) {
+  assert(!v.isValid() || v.value.bits() == bits_byte);
+  assert(!v.isValid() || v.non_poison.isBool() ||
+         v.non_poison.bits() == bits_poison_per_byte);
 
   if (!does_int_mem_access) {
     p = expr::mkUInt(0, bitsByte());
@@ -140,8 +141,16 @@ Byte::Byte(const Memory &m, const expr &data, const expr &non_poison) : m(m) {
 
   if (byte_has_ptr_bit())
     p = expr::mkUInt(0, 1);
-  p = concat_if(p, non_poison.concat(data).concat_zeros(padding_nonptr_byte()));
+  expr np = v.non_poison.isBool()
+              ? expr::mkIf(v.non_poison, expr::mkUInt(0, bits_poison_per_byte),
+                           expr::mkUInt(1, bits_poison_per_byte))
+              : v.non_poison;
+  p = concat_if(p, np.concat(v.value).concat_zeros(padding_nonptr_byte()));
   assert(!p.isValid() || p.bits() == bitsByte());
+}
+
+Byte Byte::mkPoisonByte(const Memory &m) {
+  return { m, expr::mkUInt(0, bitsByte()) };
 }
 
 expr Byte::isPtr() const {
@@ -266,40 +275,6 @@ unsigned Byte::bitsByte() {
   unsigned int_bits = does_int_mem_access * (bits_byte + bits_poison_per_byte);
   // allow at least 1 bit if there's no memory access
   return max(1u, byte_has_ptr_bit() + max(ptr_bits, int_bits));
-}
-
-Byte Byte::mkPtrByte(const Memory &m, const StateValue &val,
-                     unsigned byteoffset) {
-  assert(does_ptr_mem_access);
-  expr byte;
-  if (byte_has_ptr_bit())
-    byte = expr::mkUInt(1, 1);
-
-  expr ptr = val.non_poison.toBVBool().concat(val.value);
-  assert(bits_ptr_byte_offset() > 0 || byteoffset == 0);
-  if (bits_ptr_byte_offset() > 0)
-    ptr = ptr.concat(expr::mkUInt(byteoffset, bits_ptr_byte_offset()));
-  return { m, concat_if(byte, move(ptr)).concat_zeros(padding_ptr_byte()) };
-}
-
-Byte Byte::mkNonPtrByte(const Memory &m, const StateValue &val) {
-  if (!does_int_mem_access)
-    return { m, expr::mkUInt(0, bitsByte()) };
-  expr byte;
-  if (byte_has_ptr_bit())
-    byte = expr::mkUInt(0, 1);
-  expr np = val.non_poison.isBool()
-              ? expr::mkIf(val.non_poison, expr::mkUInt(0, bits_byte),
-                           expr::mkInt(-1, bits_byte))
-              : val.non_poison;
-  return { m, concat_if(byte, np.concat(val.value))
-                                .concat_zeros(padding_nonptr_byte()) };
-}
-
-Byte Byte::mkPoisonByte(const Memory &m) {
-  IntType ty("", bits_byte);
-  auto v = ty.toBV(ty.getDummyValue(false));
-  return { m, v.value, v.non_poison };
 }
 
 ostream& operator<<(ostream &os, const Byte &byte) {
@@ -908,30 +883,41 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             value = st.value;
           }
           else if (bytes*8 == bits && st.align >= bytes && align >= bytes) {
-            unsigned high = little_endian
-                              ? (i+1) * bytes_per_load * 8 - 1
-                              : (num_loads - i) * bytes_per_load * 8 - 1;
-            unsigned low = little_endian
-                             ? i * bytes_per_load * 8
-                             : (num_loads - i - 1) * bytes_per_load * 8;
-            value = st.value.extract(high, low);
+            auto high = [&](unsigned bits) {
+              return little_endian ? (i+1) * bytes_per_load * bits - 1
+                                   : (num_loads-i) * bytes_per_load * bits - 1;
+            };
+            auto low = [&](unsigned bits) {
+              return little_endian ? i * bytes_per_load * bits
+                                   : (num_loads - i -1) * bytes_per_load * bits;
+            };
+            value.value = st.value.value.extract(high(8), low(8));
+            value.non_poison
+              = st.value.non_poison.extract(high(bits_poison_per_byte),
+                                            low(bits_poison_per_byte));
           }
           else {
             // TODO: optimize loads from small stores to avoid shifts
-            auto diff = (ptr + i).getOffset() - st.ptr->getOffset();
-            diff = (diff * expr::mkUInt(8 * bytes_per_load, diff))
+            expr diff = (ptr + i).getOffset() - st.ptr->getOffset();
+            expr diff_v = (diff * expr::mkUInt(8 * bytes_per_load, diff))
                     .zextOrTrunc(bits);
+            expr diff_np
+              = (diff * expr::mkUInt(bits_poison_per_byte*bytes_per_load, diff))
+                  .zextOrTrunc(st.value.non_poison.bits());
 
             if (little_endian) {
-              value.value = st.value.value.lshr(diff)
+              value.value = st.value.value.lshr(diff_v)
                               .extract(bytes_per_load * 8 - 1, 0);
-              value.non_poison = st.value.non_poison.lshr(diff)
-                                   .extract(bytes_per_load * 8 - 1, 0);
+              value.non_poison
+                = st.value.non_poison.lshr(diff_np)
+                          .extract(bytes_per_load * bits_poison_per_byte-1, 0);
             } else {
-              value.value = (st.value.value << diff)
+              value.value = (st.value.value << diff_v)
                               .extract(bits - 1, bits - bytes_per_load * 8);
-              value.non_poison = (st.value.non_poison << diff)
-                                 .extract(bits - 1, bits - bytes_per_load * 8);
+              value.non_poison
+                = (st.value.non_poison << diff_np)
+                    .extract(bits - 1,
+                             bits - bytes_per_load * bits_poison_per_byte);
             }
           }
 
@@ -944,7 +930,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
                         combine_np(value.non_poison, value.value == 0) });
           } else if (type == DATA_ANY) {
             StateValue sv;
-            sv.value = Byte::mkNonPtrByte(*this, value)();
+            sv.value = Byte(*this, value)();
             store(i, sv, bits);
           } else {
             store(i, value, bits);
@@ -962,7 +948,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         } else if (type == DATA_ANY) {
           // FIXME: fix byte offset to non-0
           StateValue val;
-          val.value = Byte::mkPtrByte(*this, st.value, 0)();
+          val.value = Byte(*this, st.value, 0)();
           store(0, val, bits_byte);
         } else {
           store_ptr(st.value);
@@ -982,7 +968,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
           elem = elem.concat(st.value);
         }
         if (type == DATA_ANY) {
-          elem.value = Byte::mkNonPtrByte(*this, elem)();
+          elem.value = Byte(*this, elem)();
           elem.non_poison = expr();
         }
 
@@ -1010,7 +996,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
             Byte byte(*this, expr::mkUF(st.uf_name, { ptr_uf }, range));
             StateValue sv;
             if (type == DATA_ANY) {
-              sv.value = byte();
+              sv.value = move(byte)();
             } else if (type == DATA_INT) {
               sv.value      = byte.nonptrValue();
               sv.non_poison = combine_np(byte.nonptrNonpoison(), !byte.isPtr());

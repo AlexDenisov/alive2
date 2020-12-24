@@ -891,8 +891,6 @@ static void calculateAndInitConstants(Transform &t) {
   if (min_vect_elem_sz > 0)
     bits_poison_per_byte = (min_vect_elem_sz % 8) ? bits_byte :
                              bits_byte / gcd(bits_byte, min_vect_elem_sz);
-  // TODO: reenable optimization
-  bits_poison_per_byte = bits_byte;
 
   strlen_unroll_cnt = 10;
   memcmp_unroll_cnt = 10;

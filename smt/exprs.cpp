@@ -66,11 +66,6 @@ ostream &operator<<(ostream &os, const AndExpr &e) {
 }
 
 
-void OrExpr::add(const expr &e) {
-  if (!e.isFalse())
-    exprs.insert(e);
-}
-
 void OrExpr::add(expr &&e) {
   if (!e.isFalse())
     exprs.insert(move(e));
@@ -78,10 +73,6 @@ void OrExpr::add(expr &&e) {
 
 void OrExpr::add(const OrExpr &other) {
   exprs.insert(other.exprs.begin(), other.exprs.end());
-}
-
-bool OrExpr::contains(const expr &e) const {
-  return exprs.count(e);
 }
 
 expr OrExpr::operator()() const {

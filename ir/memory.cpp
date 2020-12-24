@@ -1985,7 +1985,7 @@ Memory::refined(const Memory &other, bool fncall,
     refine = c().implies(ret());
   } else {
     refine = (ptr_bid.uge(has_null_block + fncall * num_consts_src) &&
-              ptr_bid.ult(num_nonlocals_src))
+              ptr_bid.ule(num_nonlocals_src-1))
              .implies(ret());
   }
 

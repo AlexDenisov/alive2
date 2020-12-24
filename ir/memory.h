@@ -229,7 +229,6 @@ public:
     };
     std::vector<std::tuple<smt::expr, std::string, std::vector<Data>>> ufs;
     smt::expr non_local_liveness;
-    bool empty = true;
 
   public:
     static CallState mkIf(const smt::expr &cond, const CallState &then,

@@ -721,6 +721,14 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
   if (bytes == 0)
     return {};
 
+  if (!store_seq_head) {
+    if (type == DATA_ANY)
+      return { Byte::mkPoisonByte(*this)(), expr() };
+    return
+      { expr::mkUInt(0, type == DATA_INT ? bytes * 8 : Pointer::totalBits()),
+        false };
+  }
+
   auto alias = computeAliasing(ptr, bytes, align, false);
 
   // TODO: optimize alignment for realloc COPY nodes
@@ -753,6 +761,12 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
   assert((bytes % bytes_per_load) == 0);
   assert((bytes_per_load % (bits_byte / 8)) == 0);
   assert(type != DATA_ANY || num_loads == 1);
+
+  StateValue poison_byte;
+  if (type == DATA_ANY)
+    poison_byte.value = Byte::mkPoisonByte(*this)();
+  else
+    poison_byte = { expr::mkUInt(0, bytes_per_load * 8), false };
 
   map<tuple<const MemStore*, const Pointer*, const AliasSet*>,
       vector<StateValue>> vals;
@@ -795,12 +809,6 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       auto I = vals.find({st.next, &ptr, &alias});
       v1 = &I->second;
     }
-
-    StateValue poison_byte;
-    if (type == DATA_ANY)
-      poison_byte.value = Byte::mkPoisonByte(*this)();
-    else
-      poison_byte = { expr::mkUInt(0, bytes_per_load * 8), false };
 
     bool added_undef_vars = false;
 
@@ -1359,9 +1367,9 @@ Memory::CallState Memory::CallState::mkIf(const expr &cond,
 }
 
 expr Memory::CallState::operator==(const CallState &rhs) const {
-  if (empty != rhs.empty)
+  if (ufs.empty() != rhs.ufs.empty())
     return false;
-  if (empty)
+  if (ufs.empty())
     return true;
 
   expr ret(true);
@@ -1386,7 +1394,6 @@ Memory::CallState
 Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
                     bool nofree) {
   CallState st;
-  st.empty = false;
 
   {
     auto &data
@@ -1441,6 +1448,7 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
 }
 
 void Memory::setState(const CallState &st) {
+  assert(!st.ufs.empty());
   auto *head = store_seq_head;
   bool first = true;
   for (auto &[cond, uf, data] : st.ufs) {
@@ -1790,6 +1798,9 @@ Memory::refined(const Memory &other, bool fncall,
     auto collect_stores = [&](const Memory &m) {
       // bid -> (path, offset, size)*
       map<expr, vector<tuple<expr, expr, expr>>> stores;
+      if (!m.store_seq_head)
+        return stores;
+
       vector<pair<const MemStore*, expr>> todo = { {m.store_seq_head, true} };
       do {
         auto [st, path] = todo.back();

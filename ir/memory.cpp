@@ -1424,7 +1424,7 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
       auto alias = escaped_local_blks;
       alias.setMayAliasUpTo(false, numNonlocals() - 1,
                             has_null_block + num_consts_src);
-      get<2>(data).emplace_back(nullopt, move(alias));
+      get<2>(data).emplace_back(CallState::Data{nullopt, move(alias)});
     }
     mk_init_mem_val_axioms(get<1>(data).c_str(), true, false);
   }

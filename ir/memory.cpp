@@ -1416,7 +1416,8 @@ Memory::mkCallState(const string &fnname, const vector<PtrInput> *ptr_inputs,
       for (auto &ptr_in : *ptr_inputs) {
         if (!ptr_in.val.non_poison.isFalse()) {
           Pointer ptr(*this, ptr_in.val.value);
-          get<2>(data).emplace_back(ptr, computeAliasing(ptr, 1, 1, true));
+          get<2>(data).emplace_back(
+            CallState::Data{ptr, computeAliasing(ptr, 1, 1, true)});
         }
       }
     } else {

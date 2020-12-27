@@ -11,6 +11,9 @@
 #include <numeric>
 #include <string>
 
+// FIXME: remove; debugging only
+#include <iostream>
+
 using namespace IR;
 using namespace smt;
 using namespace std;
@@ -743,7 +746,7 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
       if (!seen.insert(st).second)
         continue;
 
-      if (st->alias.intersects(alias)) {
+      if (st->type != MemStore::COND && st->alias.intersects(alias)) {
         bytes_per_load = gcd(bytes_per_load, st->align);
         if (st->size) {
           uint64_t size = 1;
@@ -830,14 +833,22 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         if (st.size) {
           expr load_offset = (ptr + i).getShortOffset();
           expr store_offset = st.ptr->getShortOffset();
-          cond &= load_offset.uge(store_offset);
 
-          if (!load_offset.eq(store_offset)) {
-            auto upper_bound
-              = (*st.ptr + *st.size +
-                   expr::mkInt(-i * bytes_per_load, bits_for_offset));
-            cond &= load_offset.ult(upper_bound.getShortOffset());
+          // Try to optimize away the bounds checks
+          bool needs_low, needs_high;
+          if (ptr.getShortOffset().eq(store_offset)) {
+            needs_low  = false;
+            needs_high = !st.size->uge(bytes).isTrue();
+          } else {
+            needs_low  = true;
+            needs_high = !load_offset.eq(store_offset);
           }
+
+          if (needs_low)
+            cond &= load_offset.uge(store_offset);
+
+          if (needs_high)
+            cond &= load_offset.ult((*st.ptr + *st.size).getShortOffset());
         }
       } else {
         cond = (ptr + i) == *st.ptr;
@@ -849,12 +860,22 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
         added_undef_vars = true;
       }
 
-      assert(!v.value.isValid() ||
-             (type == DATA_ANY && v.value.bits() == Byte::bitsByte()) ||
-             (type != DATA_ANY && v.value.bits() == bits_byte));
-      assert(!v.non_poison.isValid() ||
-             (type == DATA_ANY || v.non_poison.isBool()) ||
-             (type != DATA_ANY || v.non_poison.bits() == bits_poison_per_byte));
+      if (v.isValid()) {
+        switch (type) {
+          case DATA_ANY:
+            assert(v.value.bits() == Byte::bitsByte());
+            assert(v.non_poison.bits() == bits_poison_per_byte);
+            break;
+          case DATA_INT:
+            assert(v.value.bits() == bits_byte);
+            assert(v.non_poison.isBool());
+            break;
+          case DATA_PTR:
+            assert(v.value.bits() == Pointer::totalBits() +  3*(num_loads > 1));
+            assert(v.non_poison.isBool());
+            break;
+        }
+      }
 
       if (v1)
         val.emplace_back(StateValue::mkIf(cond, v, (*v1)[i / bytes_per_load]));
@@ -1075,14 +1096,14 @@ StateValue Memory::load(const Pointer &ptr, unsigned bytes, set<expr> &undef,
 
   assert(type == DATA_PTR);
   auto bits = Pointer::totalBits();
-  Pointer ret_ptr(*this, val[0].value.extract(bits+2, 3));
-  expr np = true;
+  expr ret_ptr = val[0].value.extract(bits+2, 3);
+  AndExpr np;
   for (unsigned i = 0; i < bytes; i += bytes_per_load) {
-    np &= val[i].non_poison;
-    np &= val[i].value.extract(bits+2, 3) == ret_ptr();
-    np &= val[i].value.extract(2, 0) == i;
+    np.add(move(val[i].non_poison));
+    np.add(val[i].value.extract(bits+2, 3) == ret_ptr);
+    np.add(val[i].value.extract(2, 0) == i);
   }
-  return { ret_ptr.release(), move(np) };
+  return { move(ret_ptr), np() };
 }
 
 void Memory::store(optional<Pointer> ptr, const expr *bytes, unsigned align,
@@ -1232,10 +1253,8 @@ void Memory::mkAxioms(const Memory &tgt) const {
     // disjointness constraint
     for (unsigned bid2 = bid + 1; bid2 < num_nonlocals; ++bid2) {
       Pointer p2(*this, bid2, false);
-      disj &= p2.isBlockAlive()
-                .implies(disjoint(addr, sz, p2.getAddress(), p2.blockSize()));
+      state->addAxiom(disjoint(addr, sz, p2.getAddress(), p2.blockSize()));
     }
-    state->addAxiom(p1.isBlockAlive().implies(disj));
   }
 }
 
@@ -1583,7 +1602,7 @@ void Memory::startLifetime(const expr &ptr_local) {
 
   if (observesAddresses())
     state->addPre(disjoint_local_blocks(*this, p.getAddress(), p.blockSize(),
-                  local_blk_addr));
+                                        local_blk_addr));
 
   store_bv(p, true, local_block_liveness, non_local_block_liveness, true);
 }
@@ -1595,7 +1614,8 @@ void Memory::free(const expr &ptr, bool unconstrained) {
     state->addUB(p.isNull() || (p.getOffset() == 0 &&
                                 p.isBlockAlive() &&
                                 p.getAllocType() == Pointer::MALLOC));
-  store_bv(p, false, local_block_liveness, non_local_block_liveness);
+  if (!p.isNull().isTrue())
+    store_bv(p, false, local_block_liveness, non_local_block_liveness);
 }
 
 unsigned Memory::getStoreByteSize(const Type &ty) {
@@ -1937,7 +1957,7 @@ Memory::refined(const Memory &other, bool fncall,
 
   // simple linear encoding
   ret.add(
-    ptr.isBlockAlive()
+    (ptr.isBlockAlive() && ptr_offset_sizet.ult(ptr.blockSize()))
        .implies(load(ptr, undef_vars).refined(other.load(ptr, undef_vars))));
 
   // 3) check that block properties are refined
